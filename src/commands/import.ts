@@ -338,6 +338,38 @@ export async function runImport(
     console.log(`  ${chunksCreated} chunks created`);
   }
 
+  // v0.39 T7 — end-of-run schema mismatch warn. Fires ONCE per import,
+  // not per page. Counts untyped pages in the affected source AND
+  // compares to import size; warns at >=10% untyped. The doctor
+  // schema_pack_consistency check (also T7) gives the persistent surface.
+  // Best-effort: query failure is non-fatal.
+  if (imported > 0) {
+    try {
+      const sid = sourceId ?? 'default';
+      const rows = await engine.executeRaw<{ total: string | number; untyped: string | number }>(
+        `SELECT
+           COUNT(*)::text AS total,
+           COUNT(*) FILTER (WHERE type IS NULL OR type = '')::text AS untyped
+         FROM pages
+         WHERE source_id = $1 AND deleted_at IS NULL`,
+        [sid],
+      );
+      const total = Number(rows[0]?.total ?? 0);
+      const untyped = Number(rows[0]?.untyped ?? 0);
+      if (total > 0 && untyped / total >= 0.1) {
+        const pct = ((untyped / total) * 100).toFixed(1);
+        console.error(
+          `\n[schema] ${untyped} of ${total} pages (${pct}%) in source \`${sid}\` ` +
+          `have no \`type\` matching the active schema pack. Run \`gbrain schema detect\` ` +
+          `to propose a pack matching your content shape, or \`gbrain doctor --json\` ` +
+          `for the persistent surface (schema_pack_consistency check).`,
+        );
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
   // Log the ingest
   await engine.logIngest({
     source_type: 'directory',
