@@ -42,22 +42,16 @@ export interface Check {
   issues?: Array<{ type: string; skill: string; action: string; fix?: any }>;
   /**
    * v0.36+ brain-health-100: structured remediation jobs per check.
-   * Populated by the recommendation generator; consumed by
+   * Populated by the recommendation generator + (v0.40.5.0 T8b) individual
+   * checks (lint, integrity, sync_failures). Consumed by
    * `gbrain doctor --remediation-plan` / `--remediate`. Optional and
    * additive — schema_version stays at 2 (D4).
+   *
+   * v0.40.5.0 (D6): typed to RemediationStep[] from the canonical
+   * src/core/remediation-step.ts so check authors can use
+   * `makeRemediationStep()` factory without hand-rolling the shape.
    */
-  remediation?: Array<{
-    id: string;
-    job: string;
-    params: Record<string, unknown>;
-    idempotency_key: string;
-    severity: 'critical' | 'high' | 'medium' | 'low';
-    est_seconds: number;
-    est_usd_cost?: number;
-    depends_on?: string[];
-    rationale: string;
-    protected?: boolean;
-  }>;
+  remediation?: import('../core/remediation-step.ts').RemediationStep[];
   /** Top-level triage state per D13. */
   remediation_status?: 'remediable' | 'human_only' | 'blocked';
 }
@@ -2261,6 +2255,26 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
       const codeSummary = summarizeFailuresByCode(unacked);
       const codeBreakdown = codeSummary.map(s => `${s.code}=${s.count}`).join(', ');
       const preview = unacked.slice(0, 3).map(f => `${f.path} (${f.error.slice(0, 60)})`).join('; ');
+      // v0.40.5.0 T8b (D8 + D12 Bug 3): emit a single sync-retry-failed
+      // step. sync-skip-failed is DELIBERATELY NOT emitted as a remediation
+      // — auto-skipping failed syncs hides data loss. Operators can still
+      // run `gbrain sync --skip-failed` manually.
+      const { makeRemediationStep } = await import('../core/remediation-step.ts');
+      const oldestTs = unacked.reduce(
+        (acc, f) => (acc === '' || f.ts < acc ? f.ts : acc),
+        '',
+      );
+      const retryStep = makeRemediationStep({
+        id: 'sync-retry-failed',
+        job: 'sync-retry-failed',
+        // Content-stable per codex D12 Bug 2: count + oldest_ts captures
+        // the relevant state without using a real timestamp.
+        params: { failure_count: unacked.length, oldest_failure: oldestTs },
+        severity: unacked.length >= 10 ? 'high' : 'medium',
+        est_seconds: 30,
+        est_usd_cost: 0,
+        rationale: `Retry ${unacked.length} unacked sync failure(s) (codes: ${codeBreakdown})`,
+      });
       checks.push({
         name: 'sync_failures',
         status: 'warn',
@@ -2268,6 +2282,8 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
           `${unacked.length} unacknowledged sync failure(s) [${codeBreakdown}]. ${preview}` +
           `${unacked.length > 3 ? `, and ${unacked.length - 3} more` : ''}. ` +
           `Fix the file(s) and re-run 'gbrain sync', or use 'gbrain sync --skip-failed' to acknowledge.`,
+        remediation: [retryStep],
+        remediation_status: 'remediable',
       });
     } else if (all.length > 0) {
       // Acknowledged-only: show code breakdown for visibility.
@@ -3176,10 +3192,29 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
         message: `Sampled ${res.pagesScanned} pages; no bare-tweet phrases or external links.`,
       });
     } else if (res.bareHits.length > 0) {
+      // v0.40.5.0 T8b (D8): emit integrity-auto RemediationStep.
+      // Three-bucket repair handled by `gbrain integrity auto` (the
+      // existing CLI). Deterministic — no LLM cost.
+      const { makeRemediationStep } = await import('../core/remediation-step.ts');
+      const integrityStep = makeRemediationStep({
+        id: 'integrity-auto',
+        job: 'integrity-auto',
+        params: {
+          bare_count: res.bareHits.length,
+          external_count: res.externalHits.length,
+          pages_scanned: res.pagesScanned,
+        },
+        severity: res.bareHits.length > 50 ? 'high' : 'medium',
+        est_seconds: 60,
+        est_usd_cost: 0,
+        rationale: `Auto-repair ${res.bareHits.length} bare-tweet phrase(s)`,
+      });
       checks.push({
         name: 'integrity',
         status: 'warn',
         message: `Sampled ${res.pagesScanned} pages; ${res.bareHits.length} bare-tweet phrase(s), ${res.externalHits.length} external link(s). Run: gbrain integrity check (or integrity auto to repair).`,
+        remediation: [integrityStep],
+        remediation_status: 'remediable',
       });
     } else {
       checks.push({

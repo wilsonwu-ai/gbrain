@@ -1097,6 +1097,28 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
     return result;
   });
 
+  // v0.40.5.0 T8b: RemediationStep consumer handlers. Thin wrappers
+  // around already-shipping CLI commands so doctor --remediate can
+  // submit them as Minion jobs. NOT in PROTECTED_JOB_NAMES (no shell
+  // exec, no cost spike, MCP-safe).
+  worker.register('lint-fix', async (job) => {
+    const { runLintCore } = await import('./lint.ts');
+    const target = typeof job.data.dir === 'string' ? job.data.dir : '.';
+    return await runLintCore({ target, fix: true, dryRun: false });
+  });
+
+  worker.register('integrity-auto', async () => {
+    const { runIntegrity } = await import('./integrity.ts');
+    await runIntegrity(['auto']);
+    return { ok: true };
+  });
+
+  worker.register('sync-retry-failed', async () => {
+    const { runSync } = await import('./sync.ts');
+    await runSync(engine, ['--retry-failed']);
+    return { ok: true };
+  });
+
   worker.register('import', async (job) => {
     // import.ts Core extraction deferred to v0.12.0 (import has parallel
     // workers + checkpointing). Keep the CLI wrapper call but note the
