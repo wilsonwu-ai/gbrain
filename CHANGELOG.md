@@ -55,6 +55,26 @@ Four follow-up TODOs filed (in the plan file, not TODOS.md yet):
 - NEW-2: cycle-phase wrappers for the other 7 phases (sync, extract, embed, orphans, extract_facts, resolve_symbol_edges, recompute_emotional_weight)
 - NEW-3: HTTP-level trust-boundary E2E that proves serve-http.ts honors the localOnly filter at runtime (codex CMT-3 strongest defense)
 - NEW-4: render function extraction from runDoctor (would let doctor-cli-smoke move back into the parallel fast loop)
+## [0.40.7.2] - 2026-05-23
+
+**TODOS.md gets a wave-commitments register at the top.** A `/plan-ceo-review` + `/plan-eng-review` pass clustered the 110 open TODOs into 12 feature themes, articulated the platonic ideal for each, and surfaced three strategic decisions. All three landed on the most ambitious option, and the seven verified-absent items the analysis caught got filed. Nothing in `src/` changed.
+
+The new top section in TODOS.md is the canonical register for the next wave; the rest of the file is unchanged. Plan analysis at `~/.claude/plans/system-instruction-you-are-working-dazzling-pnueli.md` documents the cluster taxonomy + methodology caveats + 7 grep-verified missing items.
+
+## To take advantage of v0.40.7.2
+
+No action required — this is a docs-only release. The wave commitments below land in TODOS.md and inform what `v0.41` and `v0.42` ship. Merged into master after v0.40.7.0 (Schema Cathedral v3); bumped from 0.40.6.1 to 0.40.7.2 to clear the queue.
+
+### Itemized changes
+
+#### TODOS register at top of TODOS.md
+
+- **D1 — v0.41 Eval-loop wave (3× P0):** `gbrain eval gate <baseline>` CI verb (the single most load-bearing missing item across all 12 clusters), contributor-mode eval capture ON by default with airtight privacy, wire nightly quality probe into autopilot scheduler. Substrate is 80% built; the LOOP is 10% wired. These three close the loop.
+- **D2 — Code-indexing promoted to P1 (5 items):** `.sql` file indexing (#1173), Magika auto-detect for extension-less files, full `doc_comment` extraction at chunk time, cross-file edge resolution (Layer 5 precision), code-signature retrieval (per-language). gbrain commits to peer-of-Cursor/Sourcegraph posture.
+- **D3 — v0.42 Non-Latin script wave (5 items):** Postgres CJK FTS via pgroonga/zhparser, widen CJK ranges to Unicode property escapes, CJK-aware overlap context in chunker, Thai/Arabic/Cyrillic/Devanagari support, `git diff --name-status -z` NUL framing. gbrain commits to global-by-design.
+- **Verified-missing items (8):** `gbrain sources promote`, `--explain` auto-on during `gbrain eval replay`, extend `gbrain remote doctor` to stream audit JSONL, new `gbrain costs` command, `gbrain jobs explain <id>`, `docs/security/threat-model.md` catalog, `gbrain doctor --thin-client` parity probe, `gbrain models migrate`. Each grep-verified absent before filing.
+
+Five items duplicate older entries lower in TODOS.md (`.sql` indexing, Magika, doc_comment, CJK items) — duplication noted inline. The new top section is the canonical wave-commitment register; historical entries stay as detail.
 ## [0.40.7.0] - 2026-05-23
 
 **Your agents can now author your brain's schema pack themselves — no more shell-out, no more hand-editing YAML.** If you've ever opened `gbrain` and noticed thousands of pages stuck as untyped "notes" under `meetings/` or `research/`, this release closes that loop. Tell Wintermute (or any agent connected via MCP) "my brain has 4000 untyped meetings pages — add a `meeting` type and backfill them," and it does the whole thing safely: locks the pack file so two agents can't race, validates the change won't create dangling references, writes atomically so a crash never leaves the pack half-written, audits the mutation with the agent's identity, then updates every matching page in 1000-row batches that never wedge concurrent writers. The cathedral that was bundled but unreachable in v0.39 is now reachable from the outside.
