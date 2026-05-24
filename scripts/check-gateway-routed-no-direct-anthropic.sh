@@ -55,26 +55,66 @@ for f in "${GUARDED_FILES[@]}"; do
     FAILED=1
   fi
 
-  # Match any value-shaped (NOT type-only) import of the SDK. The type-only form
-  # `import type Anthropic from '@anthropic-ai/sdk'` is allowed for typing the
-  # adapter's Anthropic.Message return shape. Covers:
+  # Match any value-shaped (NOT type-only) import of the SDK. The type-only forms
+  # `import type Anthropic from '@anthropic-ai/sdk'` AND
+  # `import { type Foo } from '@anthropic-ai/sdk'` (all-type-clauses-only) are allowed
+  # for typing the adapter's Anthropic.Message return shape. Covers:
   #   import Anthropic from '@anthropic-ai/sdk'         (default)
   #   import { Anthropic } from '@anthropic-ai/sdk'     (named)
   #   import Anthropic, { Other } from '@anthropic-ai/sdk' (default + named)
   #   import { Anthropic as A } from '@anthropic-ai/sdk' (named-renamed)
+  #   import { type Msg, Anthropic } from '@anthropic-ai/sdk' (mixed type + value)
   #   import * as Anthropic from '@anthropic-ai/sdk'    (namespace)
-  #   const x = await import('@anthropic-ai/sdk')       (dynamic)
-  # Excludes ONLY the explicit type-only form `import type ... from '@anthropic-ai/sdk'`.
-  if grep -En "^\s*import\s+[^t][^y]*from\s+['\"]@anthropic-ai/sdk['\"]" "$f" 2>/dev/null \
-     | grep -v "^[0-9]\+:\s*import\s\+type\s" \
-     | grep .; then
-    echo
-    echo "ERROR: $f imports @anthropic-ai/sdk as a runtime value."
-    echo "       Use \`import type Anthropic from '@anthropic-ai/sdk'\` for type-only"
-    echo "       references to Anthropic.Message / Anthropic.MessageCreateParamsNonStreaming."
-    echo "       Route runtime chat calls through src/core/ai/gateway.ts."
-    FAILED=1
-  fi
+  # Strategy: catch every line ending in `from '@anthropic-ai/sdk'`, strip
+  # comment lines, strip top-level `import type ...` (the only allowed shape),
+  # then check whether any remaining line contains a value identifier OUTSIDE
+  # type-prefixed clauses. We handle the mixed-import case by inspecting the
+  # specifier list: if any specifier is not `type Foo`, the import is value-shaped.
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    # Strip the leading "line-number:" prefix grep adds.
+    body="${line#*:}"
+    # Top-level `import type ...` is allowed — entire import is type-only.
+    if printf '%s' "$body" | grep -qE '^\s*import\s+type\s'; then continue; fi
+    # Comment line.
+    if printf '%s' "$body" | grep -qE '^\s*(//|\*)'; then continue; fi
+    # Extract the specifiers list (between `import` and `from`), if present.
+    # If the list contains any specifier NOT prefixed with `type ` (or there's
+    # no brace list at all — default/namespace import), it's a value import.
+    # POSIX character classes for cross-shell portability (macOS BSD sed
+     # doesn't support `\s` even in extended-regex mode).
+    specifiers=$(printf '%s' "$body" | sed -nE 's/^[[:space:]]*import[[:space:]]+\{([^}]*)\}[[:space:]]+from.*/\1/p')
+    if [ -n "$specifiers" ]; then
+      # Brace list present. Allow only if EVERY non-empty specifier is type-prefixed.
+      # Use a temp file instead of `while | exit 1` (subshell trap).
+      tmpflag=$(mktemp -t gateway-guard-XXXX)
+      echo 0 > "$tmpflag"
+      printf '%s' "$specifiers" | tr ',' '\n' | while IFS= read -r spec; do
+        spec=$(printf '%s' "$spec" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+        [ -z "$spec" ] && continue
+        if ! printf '%s' "$spec" | grep -qE '^type\s'; then echo 1 > "$tmpflag"; fi
+      done
+      has_value=$(cat "$tmpflag")
+      rm -f "$tmpflag"
+      if [ "$has_value" = "1" ]; then
+        echo "$line"
+        echo
+        echo "ERROR: $f imports @anthropic-ai/sdk with a value-shaped specifier."
+        echo "       Use \`import type ...\` for all clauses, or route runtime"
+        echo "       chat calls through src/core/ai/gateway.ts."
+        FAILED=1
+      fi
+    else
+      # No brace list — default, namespace, or bare import — always value-shaped.
+      echo "$line"
+      echo
+      echo "ERROR: $f imports @anthropic-ai/sdk as a runtime value."
+      echo "       Use \`import type Anthropic from '@anthropic-ai/sdk'\` for type-only"
+      echo "       references to Anthropic.Message / Anthropic.MessageCreateParamsNonStreaming."
+      echo "       Route runtime chat calls through src/core/ai/gateway.ts."
+      FAILED=1
+    fi
+  done < <(grep -En "from\s+['\"]@anthropic-ai/sdk['\"]" "$f" 2>/dev/null)
   # Dynamic import — also a value-shaped reference.
   if grep -En "import\s*\(\s*['\"]@anthropic-ai/sdk['\"]" "$f" 2>/dev/null \
      | grep -vE '^[0-9]+:\s*(//|\*)' | grep .; then
