@@ -223,7 +223,7 @@ beforeAll(async () => {
   await engine.initSchema();
 
   // Seed 5 files per language, 25 total (scaled down from the plan's
-  // ~50 files to keep test runtime under 5 seconds). The retrieval
+  // ~50 files to keep test runtime predictable). The retrieval
   // signal is the same shape at 25 as at 50.
   const names = ['Auth', 'Cache', 'Queue', 'Router', 'Store'];
   for (const n of names) {
@@ -233,7 +233,9 @@ beforeAll(async () => {
     await importCodeFile(engine, `rust/${n.toLowerCase()}.rs`, generateRustFile(n), { noEmbed: true });
     await importCodeFile(engine, `java/${n}.java`, generateJavaFile(n), { noEmbed: true });
   }
-});
+  // v0.41 D2 wave: 92-migration replay + SQL grammar load can push the
+  // default 5s beforeAll budget on slower CI runners; bump explicitly.
+}, 30000);
 
 afterAll(async () => {
   await engine.disconnect();
@@ -333,5 +335,118 @@ describe('BrainBench code — edge cases', () => {
     const secondResult = await findCodeDef(engine, 'AuthService', { language: 'typescript' });
     // Same symbol count — no duplication.
     expect(secondResult.length).toBe(count1);
+  });
+});
+
+// ────────────────────────────────────────────────────────────
+// v0.41 D2 wave (#1173) — SQL indexing E2E.
+// Load-bearing canary for the "D2 = code-brain peer" thesis: tree-sitter
+// chunks SQL into per-statement chunks, DDL kinds carry symbol_name +
+// symbol_type populated from CREATE TABLE/FUNCTION/INDEX targets, and
+// findCodeDef returns those chunks when queried by name. Without this
+// path working, SQL chunks would be "just searchable text", not code
+// intelligence (codex F2 in /plan-eng-review).
+// ────────────────────────────────────────────────────────────
+describe('SQL code indexing — DDL chunks + code-def works', () => {
+  // Statement bodies must be long enough to defeat the small-sibling
+  // merger; ~120+ tokens per statement keeps each chunk independent.
+  const SQL_FIXTURE = `
+CREATE TABLE users_account_table_long_enough_to_avoid_merger (
+  id SERIAL PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  display_name TEXT,
+  phone_number TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP,
+  deleted_at TIMESTAMP,
+  email_verified_at TIMESTAMP,
+  last_login_at TIMESTAMP,
+  metadata JSONB DEFAULT '{}'::jsonb,
+  preferences JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE OR REPLACE FUNCTION get_user_by_email_lookup_full_function_name(p_email TEXT)
+RETURNS users_account_table_long_enough_to_avoid_merger AS $$
+DECLARE
+  result users_account_table_long_enough_to_avoid_merger;
+BEGIN
+  SELECT * INTO result
+  FROM users_account_table_long_enough_to_avoid_merger
+  WHERE email = p_email
+    AND deleted_at IS NULL
+  LIMIT 1;
+  RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE INDEX idx_users_account_email_for_login_lookup_with_long_name
+  ON users_account_table_long_enough_to_avoid_merger (email, created_at, deleted_at);
+
+CREATE VIEW active_users_dashboard_summary_view_long_enough_to_split AS
+  SELECT u.id, u.email, u.display_name, u.last_login_at, u.created_at
+  FROM users_account_table_long_enough_to_avoid_merger u
+  WHERE u.deleted_at IS NULL
+    AND u.email_verified_at IS NOT NULL
+  ORDER BY u.last_login_at DESC NULLS LAST;
+`;
+
+  test('SQL import produces page with type=code + page_kind=code', async () => {
+    await importCodeFile(engine, 'migrations/001_users.sql', SQL_FIXTURE, { noEmbed: true });
+    const rows = await engine.executeRaw<{ type: string; page_kind: string }>(
+      `SELECT type, page_kind FROM pages WHERE slug = $1`,
+      ['migrations-001_users-sql'],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.type).toBe('code');
+    expect(rows[0]!.page_kind).toBe('code');
+  });
+
+  test('CREATE TABLE chunk carries symbol_name=table name + symbol_type=table', async () => {
+    const rows = await engine.executeRaw<{ symbol_name: string; symbol_type: string; language: string }>(
+      `SELECT symbol_name, symbol_type, language FROM content_chunks
+       WHERE page_id = (SELECT id FROM pages WHERE slug = $1)
+         AND symbol_name = $2`,
+      ['migrations-001_users-sql', 'users_account_table_long_enough_to_avoid_merger'],
+    );
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    expect(rows[0]!.symbol_type).toBe('table');
+    expect(rows[0]!.language).toBe('sql');
+  });
+
+  test('CREATE FUNCTION chunk carries symbol_name=function name + symbol_type=function', async () => {
+    const rows = await engine.executeRaw<{ symbol_name: string; symbol_type: string }>(
+      `SELECT symbol_name, symbol_type FROM content_chunks
+       WHERE page_id = (SELECT id FROM pages WHERE slug = $1)
+         AND symbol_name = $2`,
+      ['migrations-001_users-sql', 'get_user_by_email_lookup_full_function_name'],
+    );
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    expect(rows[0]!.symbol_type).toBe('function');
+  });
+
+  test('findCodeDef returns CREATE TABLE site (load-bearing D2 canary)', async () => {
+    const results = await findCodeDef(engine, 'users_account_table_long_enough_to_avoid_merger', { language: 'sql' });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0]!.slug).toBe('migrations-001_users-sql');
+    expect(results[0]!.symbol_type).toBe('table');
+  });
+
+  test('findCodeDef returns CREATE FUNCTION site by name', async () => {
+    const results = await findCodeDef(engine, 'get_user_by_email_lookup_full_function_name', { language: 'sql' });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0]!.symbol_type).toBe('function');
+  });
+
+  test('findCodeDef returns CREATE INDEX site by name', async () => {
+    const results = await findCodeDef(engine, 'idx_users_account_email_for_login_lookup_with_long_name', { language: 'sql' });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0]!.symbol_type).toBe('index');
+  });
+
+  test('findCodeDef returns CREATE VIEW site by name', async () => {
+    const results = await findCodeDef(engine, 'active_users_dashboard_summary_view_long_enough_to_split', { language: 'sql' });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0]!.symbol_type).toBe('view');
   });
 });
