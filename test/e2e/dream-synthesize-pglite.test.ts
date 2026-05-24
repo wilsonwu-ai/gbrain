@@ -45,18 +45,28 @@ async function setupRig(): Promise<TestRig> {
 }
 
 /**
- * Run `body` with ANTHROPIC_API_KEY temporarily cleared, restoring the
- * prior value (set or unset) on return — even on throw — so this never
- * leaks state to sibling test files in the suite.
+ * Run `body` with ANTHROPIC_API_KEY temporarily cleared AND GBRAIN_HOME
+ * pointed at a fresh tmpdir, restoring both on return — even on throw — so
+ * the developer's real ~/.gbrain/config.json never leaks the anthropic_api_key
+ * into the test's hasAnthropicKey() probe. Required after the v0.41 gateway-
+ * adapter rework: makeJudgeClient now checks BOTH env AND config file (the
+ * same hasAnthropicKey() pattern think/index.ts uses since v0.35.5.0), so
+ * clearing only the env var is insufficient hermeticity.
  */
 async function withoutAnthropicKey<T>(body: () => Promise<T>): Promise<T> {
-  const saved = process.env.ANTHROPIC_API_KEY;
+  const savedKey = process.env.ANTHROPIC_API_KEY;
+  const savedHome = process.env.GBRAIN_HOME;
+  const tmpHome = mkdtempSync(join(tmpdir(), 'gbrain-synth-isol-'));
   delete process.env.ANTHROPIC_API_KEY;
+  process.env.GBRAIN_HOME = tmpHome;
   try {
     return await body();
   } finally {
-    if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
-    else process.env.ANTHROPIC_API_KEY = saved;
+    if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = savedKey;
+    if (savedHome === undefined) delete process.env.GBRAIN_HOME;
+    else process.env.GBRAIN_HOME = savedHome;
+    try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* */ }
   }
 }
 
@@ -131,7 +141,11 @@ describe('E2E synthesize — no API key skip path', () => {
         const verdicts = (result.details as { verdicts: Array<{ worth: boolean; reasons: string[] }> }).verdicts;
         expect(verdicts).toHaveLength(1);
         expect(verdicts[0].worth).toBe(false);
-        expect(verdicts[0].reasons[0]).toMatch(/ANTHROPIC_API_KEY/);
+        // v0.41 gateway-adapter rework: reason text now names the verdict
+        // model so the user can see WHICH provider was missing. Pre-rework
+        // string was 'no ANTHROPIC_API_KEY for significance judge'; post-
+        // rework is 'no configured provider for verdict model: <model>'.
+        expect(verdicts[0].reasons[0]).toMatch(/no configured provider for verdict model/);
       });
     } finally {
       await rig.cleanup();
@@ -344,7 +358,11 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
         // the no-key path makes it worth=false.
         const verdicts = (result.details as { verdicts: Array<{ worth: boolean; reasons: string[] }> }).verdicts;
         expect(verdicts).toHaveLength(1);
-        expect(verdicts[0].reasons[0]).toMatch(/ANTHROPIC_API_KEY/);
+        // v0.41 gateway-adapter rework: reason text now names the verdict
+        // model so the user can see WHICH provider was missing. Pre-rework
+        // string was 'no ANTHROPIC_API_KEY for significance judge'; post-
+        // rework is 'no configured provider for verdict model: <model>'.
+        expect(verdicts[0].reasons[0]).toMatch(/no configured provider for verdict model/);
         // Loud warning fired at phase entry so the operator never wonders
         // why the guard quietly let dream output through.
         expect(stderr).toMatch(/\[dream\] WARNING: --unsafe-bypass-dream-guard set/);
