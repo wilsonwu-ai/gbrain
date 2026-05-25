@@ -43,17 +43,21 @@ cd "$ROOT"
 TARGET_DIR="${1:-test}"
 ALLOWLIST_FILE="$ROOT/scripts/check-test-isolation.allowlist"
 
-# Read allowlist (one filename per line, # comments allowed). Empty file
-# is fine — every violation will fail.
-ALLOWLIST=""
-if [ -f "$ALLOWLIST_FILE" ]; then
-  ALLOWLIST="$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | grep -v '^[[:space:]]*$' || true)"
-fi
-
+# Allow-list lookup runs grep directly against the file rather than
+# through an `echo "$ALLOWLIST" | grep` indirection. The cached-variable
+# approach passed bash 3.2 + GNU grep on macOS but flaked on Ubuntu 24.04
+# in CI (the matched-file string never matched the cached ALLOWLIST when
+# read back via echo, despite identical contents on disk). Reading the
+# file directly per-call is ~700 cheap grep invocations on a fresh CI
+# runner; trivial compared to test execution.
 is_allowlisted() {
   local f="$1"
-  [ -z "$ALLOWLIST" ] && return 1
-  echo "$ALLOWLIST" | grep -qxF "$f"
+  [ -f "$ALLOWLIST_FILE" ] || return 1
+  # Strip comments + blanks then exact-line match. -F = literal,
+  # -x = whole line, -q = quiet.
+  grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" \
+    | grep -v '^[[:space:]]*$' \
+    | grep -qxF "$f"
 }
 
 # Find non-serial unit test files (excluding test/e2e). Portable across
