@@ -776,7 +776,16 @@ export class PostgresEngine implements BrainEngine {
     const reserved = await pool.reserve();
     try {
       const conn: ReservedConnection = {
-        async executeRaw<R = Record<string, unknown>>(query: string, params?: unknown[]): Promise<R[]> {
+        async executeRaw<R = Record<string, unknown>>(
+          query: string,
+          params?: unknown[],
+          opts?: { signal?: AbortSignal },
+        ): Promise<R[]> {
+          // ReservedConnection.executeRaw doesn't wire AbortSignal today
+          // (the only use site is migrations + cycle-lock writes that don't
+          // want cancellation). Signature matches the interface so callers
+          // that pass opts don't typecheck-break; opts.signal is ignored.
+          void opts;
           const rows = params === undefined
             ? await reserved.unsafe(query)
             : await reserved.unsafe(query, params as Parameters<typeof reserved.unsafe>[1]);
@@ -1977,11 +1986,86 @@ export class PostgresEngine implements BrainEngine {
     afterPageId?: number;
     afterChunkIndex?: number;
     sourceId?: string;
+    orderBy?: 'page_id' | 'updated_desc';
+    afterUpdatedAt?: string | null;
   }): Promise<StaleChunkRow[]> {
     const sql = this.sql;
     const limit = opts?.batchSize ?? 2000;
     const afterPid = opts?.afterPageId ?? 0;
     const afterIdx = opts?.afterChunkIndex ?? -1;
+    const orderBy = opts?.orderBy ?? 'page_id';
+
+    // v0.41.18.0 (A13, codex #9): --priority recent path. Composite cursor
+    // (updated_at DESC NULLS LAST, page_id ASC, chunk_index ASC). Backed by
+    // idx_pages_updated_at_desc + content_chunks_stale_idx partial.
+    // "Next row" semantic with DESC NULLS LAST + ASC tiebreakers is:
+    //   (updated_at < prev) OR
+    //   (updated_at = prev AND page_id > prev_page_id) OR
+    //   (updated_at = prev AND page_id = prev_page_id AND chunk_index > prev_chunk_index)
+    // First call: afterUpdatedAt undefined → returns the highest updated_at rows.
+    if (orderBy === 'updated_desc') {
+      const afterUpdated = opts?.afterUpdatedAt ?? null;
+      const isFirstPage = afterUpdated === null && afterPid === 0;
+      if (opts?.sourceId === undefined) {
+        const rows = isFirstPage ? await sql`
+          SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+                 cc.model, cc.token_count, p.source_id, cc.page_id,
+                 p.updated_at
+          FROM content_chunks cc
+          JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+          ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
+          LIMIT ${limit}
+        ` : await sql`
+          SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+                 cc.model, cc.token_count, p.source_id, cc.page_id,
+                 p.updated_at
+          FROM content_chunks cc
+          JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+            AND (
+              p.updated_at < ${afterUpdated}::timestamptz
+              OR (p.updated_at = ${afterUpdated}::timestamptz AND p.id > ${afterPid})
+              OR (p.updated_at = ${afterUpdated}::timestamptz AND p.id = ${afterPid} AND cc.chunk_index > ${afterIdx})
+            )
+          ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
+          LIMIT ${limit}
+        `;
+        return rows as unknown as StaleChunkRow[];
+      }
+      const rows = isFirstPage ? await sql`
+        SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+               cc.model, cc.token_count, p.source_id, cc.page_id,
+               p.updated_at
+        FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+        WHERE cc.embedding IS NULL
+          AND p.source_id = ${opts.sourceId}
+          AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+        ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
+        LIMIT ${limit}
+      ` : await sql`
+        SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+               cc.model, cc.token_count, p.source_id, cc.page_id,
+               p.updated_at
+        FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+        WHERE cc.embedding IS NULL
+          AND p.source_id = ${opts.sourceId}
+          AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+          AND (
+            p.updated_at < ${afterUpdated}::timestamptz
+            OR (p.updated_at = ${afterUpdated}::timestamptz AND p.id > ${afterPid})
+            OR (p.updated_at = ${afterUpdated}::timestamptz AND p.id = ${afterPid} AND cc.chunk_index > ${afterIdx})
+          )
+        ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
+        LIMIT ${limit}
+      `;
+      return rows as unknown as StaleChunkRow[];
+    }
+    // orderBy === 'page_id' — legacy stable cursor (unchanged below).
     // Cursor-paginated: keyset pagination on (page_id, chunk_index).
     // The partial index idx_chunks_embedding_null makes the WHERE fast;
     // LIMIT keeps each round-trip well within statement_timeout.
@@ -2102,15 +2186,17 @@ export class PostgresEngine implements BrainEngine {
     const fromSourceIds = links.map(l => l.from_source_id || 'default');
     const toSourceIds = links.map(l => l.to_source_id || 'default');
     const originSourceIds = links.map(l => l.origin_source_id || 'default');
+    // v0.41.18.0 (A10): link_kind column (v98). NULL = legacy/plain.
+    const linkKinds = links.map(l => l.link_kind ?? null);
     const result = await sql`
-      INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
-      SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field
+      INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field)
+      SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field
       FROM unnest(
         ${fromSlugs}::text[], ${toSlugs}::text[], ${linkTypes}::text[],
         ${contexts}::text[], ${linkSources}::text[], ${originSlugs}::text[],
         ${originFields}::text[], ${fromSourceIds}::text[], ${toSourceIds}::text[],
-        ${originSourceIds}::text[]
-      ) AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id)
+        ${originSourceIds}::text[], ${linkKinds}::text[]
+      ) AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id, link_kind)
       JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
       JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
       LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
@@ -2493,7 +2579,7 @@ export class PostgresEngine implements BrainEngine {
     if (slugs.length === 0) return result;
     for (const s of slugs) result.set(s, 0);
 
-    // v0.42.0.0 D12: filter mentions OUT of backlink-count for search
+    // v0.41.18.0 D12: filter mentions OUT of backlink-count for search
     // ranking. `link_source='mentions'` rows are auto-linked body-text
     // mentions from `gbrain extract links --by-mention`; they're
     // graph-completeness signal, NOT human-intent signal. Counting them
@@ -2710,7 +2796,7 @@ export class PostgresEngine implements BrainEngine {
       INSERT INTO timeline_entries (page_id, date, source, summary, detail)
       SELECT id, ${entry.date}::date, ${entry.source || ''}, ${entry.summary}, ${entry.detail || ''}
       FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}
-      ON CONFLICT (page_id, date, summary) DO NOTHING
+      ON CONFLICT (page_id, date, summary, source) DO NOTHING
     `;
   }
 
@@ -2729,7 +2815,7 @@ export class PostgresEngine implements BrainEngine {
       FROM unnest(${slugs}::text[], ${dates}::text[], ${sources}::text[], ${summaries}::text[], ${details}::text[], ${sourceIds}::text[])
         AS v(slug, date, source, summary, detail, source_id)
       JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id
-      ON CONFLICT (page_id, date, summary) DO NOTHING
+      ON CONFLICT (page_id, date, summary, source) DO NOTHING
       RETURNING 1
     `;
     return result.length;
@@ -4255,9 +4341,41 @@ export class PostgresEngine implements BrainEngine {
     }
   }
 
-  async executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
+  async executeRaw<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<T[]> {
     const conn = this.sql;
-    return conn.unsafe(sql, params as Parameters<typeof conn.unsafe>[1]) as unknown as T[];
+    const pending = conn.unsafe(sql, params as Parameters<typeof conn.unsafe>[1]);
+    // v0.41.18.0 (A20, codex #7): real cancellation via postgres.js's
+    // .cancel() on the pending query. Init nudge (3s wallclock cap) is the
+    // first consumer; the AbortSignal fires when the timer trips.
+    // Already-aborted signal short-circuits before the network round-trip.
+    if (opts?.signal) {
+      if (opts.signal.aborted) {
+        // .cancel() is fire-and-forget; the awaited query rejects with the
+        // postgres "query was cancelled" error which the caller catches.
+        try {
+          (pending as unknown as { cancel?: () => void }).cancel?.();
+        } catch {
+          // best-effort
+        }
+        throw new DOMException('aborted', 'AbortError');
+      }
+      const onAbort = () => {
+        try {
+          (pending as unknown as { cancel?: () => void }).cancel?.();
+        } catch {
+          // best-effort; the .then below settles regardless
+        }
+      };
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+      return (pending as unknown as Promise<T[]>).finally(() => {
+        opts.signal?.removeEventListener('abort', onAbort);
+      });
+    }
+    return pending as unknown as T[];
     // Pre-#406 behavior: throw on any error including connection death.
     // Per-call auto-retry is not safe here because executeRaw is also used
     // for non-transactional mutations (DELETE/UPDATE/INSERT in sources.ts,

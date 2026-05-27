@@ -58,6 +58,7 @@ CHECKS=(
   "check:fixture-privacy"
   "check:conversation-parser"
   "check:resolver"
+  "check:source-scope-onboard"
   "typecheck"
 )
 
