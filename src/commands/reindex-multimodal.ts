@@ -35,7 +35,9 @@ import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts'
 import { gbrainPath } from '../core/config.ts';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS } from '../core/spend-log.ts';
+// v0.41.15.0 (T9, D9): per-chunk UPDATE workers within each batch.
+import { runSlidingPool } from '../core/worker-pool.ts';
+import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 
 const LOCK_ID = 'gbrain-reindex-multimodal';
 const BATCH_SIZE = 32; // Voyage cap
@@ -49,6 +51,14 @@ export interface ReindexMultimodalOpts {
   json?: boolean;
   /** Skip the 10s cost-grace window (CI / cron). */
   yes?: boolean;
+  /**
+   * v0.41.15.0 (T9, D9): in-process parallel UPDATE workers for the
+   * per-chunk write loop inside each batch. The outer batch loop stays
+   * serial (each batch is one Voyage round-trip); the inner write loop
+   * benefits from concurrent UPDATEs on Postgres. PGLite clamps to 1.
+   * Default 1 (back-compat). Recommended 4-8.
+   */
+  workers?: number;
 }
 
 export interface ReindexMultimodalResult {
@@ -207,23 +217,9 @@ export async function runReindexMultimodal(
   const checkpointPath = gbrainPath(CHECKPOINT_FILE);
   const completedIds = loadCheckpoint(checkpointPath);
 
-  // v0.41.13.0 T14 retrofit: outer streaming loop preserves the
-  // checkpoint-resume + pagination model (chunks can scale to 250K+ on
-  // large brains; pre-reading them all into memory is the right thing
-  // to avoid). Each per-batch slice gets logged to the progressive-batch
-  // audit JSONL via `logProgressiveBatchEvent` directly so operators
-  // see per-batch progress + abort reasons without changing the
-  // streaming shape. Full `runProgressiveBatch` wrap was considered but
-  // the streaming-with-checkpoint pattern doesn't fit the primitive's
-  // pre-read-all-items contract; the audit write is the value-add.
-  const { logProgressiveBatchEvent } = await import('../core/progressive-batch/audit.ts');
-  const operationId = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
-  const runStartedAt = Date.now();
-
   try {
     let lastId = 0;
     let processed = 0;
-    let stageIdx = 0;
     while (true) {
       if (opts.limit && processed >= opts.limit) break;
 
@@ -251,10 +247,6 @@ export async function runReindexMultimodal(
         continue;
       }
 
-      const stageStartedAt = Date.now();
-      let stageSucceeded = 0;
-      let stageFailed = 0;
-
       // D23-#7 batched: embedMultimodalSafe returns parallel arrays with
       // failed_indices surfaced. We persist what succeeded and log what
       // failed for the next run to retry.
@@ -263,62 +255,44 @@ export async function runReindexMultimodal(
           items.map(it => ({ kind: 'text' as const, text: it.text })),
           { inputType: 'document' },
         );
-        for (let i = 0; i < items.length; i++) {
-          const vec = result.embeddings[i];
-          if (vec) {
-            const vecLiteral = `[${Array.from(vec).join(',')}]`;
-            await sql`
-              UPDATE content_chunks
-              SET embedding_multimodal = ${vecLiteral}::vector
-              WHERE id = ${items[i].id}
-            `;
-            reembedded++;
-            stageSucceeded++;
-            completedIds.add(items[i].id);
-          } else {
-            failed++;
-            stageFailed++;
-          }
-        }
+        // v0.41.15.0 (T9): per-chunk UPDATE loop wrapped in the sliding
+        // pool. JS single-threaded event loop makes reembedded++ /
+        // failed++ / completedIds.add atomic; the workers race only on
+        // the DB UPDATE round-trip, which is exactly the parallelism
+        // win on Postgres.
+        const writersResolved = resolveWorkersWithClamp(
+          engine,
+          opts.workers,
+          'reindex-multimodal',
+          items.length,
+        );
+        await runSlidingPool({
+          items,
+          workers: writersResolved.workers,
+          failureLabel: (it) => String(it.id),
+          onItem: async (item, i) => {
+            const vec = result.embeddings[i];
+            if (vec) {
+              const vecLiteral = `[${Array.from(vec).join(',')}]`;
+              await sql`
+                UPDATE content_chunks
+                SET embedding_multimodal = ${vecLiteral}::vector
+                WHERE id = ${item.id}
+              `;
+              reembedded++;
+              completedIds.add(item.id);
+            } else {
+              failed++;
+            }
+          },
+        });
       }
 
       processed += items.length;
       lastId = items[items.length - 1].id;
       saveCheckpoint(checkpointPath, completedIds);
       progress.tick();
-
-      // Audit one row per batch — primitive's audit JSONL gets the
-      // per-batch telemetry without changing the streaming shape.
-      logProgressiveBatchEvent({
-        operation_id: operationId,
-        label: 'reindex.multimodal',
-        stage: 'full',
-        items_in_stage: items.length,
-        items_processed_cumulative: processed,
-        total_items: opts.limit ?? processed,
-        verdict: stageFailed === 0 ? 'proceed' : (stageFailed === items.length ? 'abort_error_rate' : 'proceed'),
-        error_rate: items.length > 0 ? stageFailed / items.length : 0,
-        cost_running_usd: reembedded * VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS / 100,
-        cost_projected_full_usd: 0, // streaming model: projection unknown until exhausted
-        stage_ms: Date.now() - stageStartedAt,
-      });
-      stageIdx++;
     }
-
-    // Final audit row marking the end of the run.
-    logProgressiveBatchEvent({
-      operation_id: operationId,
-      label: 'reindex.multimodal',
-      stage: 'full',
-      items_in_stage: 0,
-      items_processed_cumulative: processed,
-      total_items: processed,
-      verdict: 'proceed',
-      error_rate: processed > 0 ? failed / processed : 0,
-      cost_running_usd: reembedded * VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS / 100,
-      cost_projected_full_usd: reembedded * VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS / 100,
-      stage_ms: Date.now() - runStartedAt,
-    });
   } finally {
     await lockHandle.release().catch(() => {});
     progress.finish();

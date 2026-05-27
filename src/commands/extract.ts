@@ -43,6 +43,10 @@ import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts'
 import { pathToSlug, pruneDir, isSyncable } from '../core/sync.ts';
 import { isRetryableConnError } from '../core/retry-matcher.ts';
 import { buildGazetteer, findMentionedEntities } from '../core/by-mention.ts';
+// v0.41.15.0 (T7, D9): --workers N for the fs-walk inner loops via the
+// shared sliding-pool helper + PGLite-clamp wrapper.
+import { runSlidingPool } from '../core/worker-pool.ts';
+import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -370,6 +374,19 @@ export interface ExtractOpts {
    * Pass undefined or omit for a full walk (CLI / first-run path).
    */
   slugs?: string[];
+  /**
+   * v0.41.15.0 (D9): in-process parallel file workers for the fs-walk
+   * loops. Default 1. PGLite engines clamp to 1 (single-writer; though
+   * extract is mostly CPU-bound, the DB batch flush still hits the
+   * write lock). Recommended 4-8 for very large brains where file IO +
+   * regex parsing dominate wallclock.
+   *
+   * Honored by: extractLinksFromDir, extractTimelineFromDir, extractForSlugs.
+   * NOT honored by: extractLinksFromDB, extractTimelineFromDB,
+   * extractMentionsFromDb (DB-source paths) — those use the engine's
+   * own pagination and stay serial in v0.41.15.0.
+   */
+  workers?: number;
 }
 
 /**
@@ -390,6 +407,17 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
   const jsonMode = !!opts.jsonMode;
   const result: ExtractResult = { links_created: 0, timeline_entries_created: 0, pages_processed: 0 };
 
+  // v0.41.15.0 (D9): resolve workers via the PGLite-clamp wrapper.
+  // Page count unknown at this point — pass 0 so the auto-path falls
+  // back to override-or-1 instead of running the >100-files heuristic.
+  const workersResolved = resolveWorkersWithClamp(
+    engine,
+    opts.workers,
+    'extract',
+    0,
+  );
+  const workers = workersResolved.workers;
+
   // Incremental path: if specific slugs provided, only extract from those files.
   // This is the cycle path — sync tells us what changed, we only re-extract those.
   if (opts.slugs !== undefined) {
@@ -397,7 +425,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
       // Nothing changed — skip entirely.
       return result;
     }
-    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode);
+    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers);
     result.links_created = r.links_created;
     result.timeline_entries_created = r.timeline_created;
     result.pages_processed = r.pages;
@@ -406,12 +434,12 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
 
   // Full walk path: CLI `gbrain extract` or first-run.
   if (opts.mode === 'links' || opts.mode === 'all') {
-    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode);
+    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, workers);
     result.links_created = r.created;
     result.pages_processed = r.pages;
   }
   if (opts.mode === 'timeline' || opts.mode === 'all') {
-    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode);
+    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, workers);
     result.timeline_entries_created = r.created;
     result.pages_processed = Math.max(result.pages_processed, r.pages);
   }
@@ -457,6 +485,21 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   // mention pass (skip default link extract). DB-source only per D7;
   // FS-source is rejected with a paste-ready fix-hint below.
   const byMention = args.includes('--by-mention');
+  // v0.41.15.0 (T7, D9): --workers N parsed via the shared validator.
+  // Honored on the fs-walk inner loops only; DB-source paths stay
+  // serial in v0.41.15.0 (see ExtractOpts.workers doc).
+  let workers: number | undefined;
+  const workersIdx = args.indexOf('--workers');
+  const concurrencyIdx = args.indexOf('--concurrency');
+  const workersValIdx = workersIdx >= 0 ? workersIdx + 1 : (concurrencyIdx >= 0 ? concurrencyIdx + 1 : -1);
+  if (workersValIdx > 0 && workersValIdx < args.length) {
+    try {
+      workers = parseWorkers(args[workersValIdx]);
+    } catch (e) {
+      console.error((e as Error).message);
+      process.exit(1);
+    }
+  }
 
   // Validate --since upfront. Without this, an invalid date like
   // `--since yesterday` produces NaN which silently passes the filter check
@@ -562,6 +605,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
         dir: brainDir,
         dryRun,
         jsonMode,
+        workers,
       });
     }
   } catch (e) {
@@ -593,6 +637,12 @@ async function extractForSlugs(
   mode: 'links' | 'timeline' | 'all',
   dryRun: boolean,
   jsonMode: boolean,
+  // v0.41.15.0 (T7): in-process worker count. Default 1 — back-compat
+  // for every caller that doesn't pass it explicitly. The sliding pool
+  // accumulates per-worker local batches and flushes each via the
+  // shared flush primitive; JS single-threaded event loop makes the
+  // shared counter increments atomic.
+  workers: number = 1,
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
@@ -644,46 +694,55 @@ async function extractForSlugs(
     }
   }
 
-  for (const slug of slugs) {
-    const relPath = slug + '.md';
-    const fullPath = join(brainDir, relPath);
+  // v0.41.15.0 (T7): sliding-pool fan-out. The shared linkBatch /
+  // timelineBatch arrays + flush functions still serve correctly because
+  // every push + length check + length=0 reset is synchronous JS — no
+  // await between the check and the reset means workers never see a
+  // half-cleared batch. flushLinks/flushTimeline snapshot before await,
+  // so the second worker's pushes during the await land cleanly in the
+  // (now-empty) batch for the next flush.
+  await runSlidingPool({
+    items: slugs,
+    workers,
+    failureLabel: (slug) => slug,
+    onItem: async (slug) => {
+      const relPath = slug + '.md';
+      const fullPath = join(brainDir, relPath);
+      try {
+        if (!existsSync(fullPath)) return; // deleted file — sync already handled removal
+        const content = readFileSync(fullPath, 'utf-8');
 
-    try {
-      if (!existsSync(fullPath)) continue; // deleted file — sync already handled removal
-      const content = readFileSync(fullPath, 'utf-8');
-
-      // Links
-      if (doLinks) {
-        const links = await extractLinksFromFile(content, relPath, allSlugs);
-        for (const link of links) {
-          if (dryRun) {
-            if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
-            linksCreated++;
-          } else {
-            linkBatch.push(link);
-            if (linkBatch.length >= BATCH_SIZE) await flushLinks();
+        if (doLinks) {
+          const links = await extractLinksFromFile(content, relPath, allSlugs);
+          for (const link of links) {
+            if (dryRun) {
+              if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
+              linksCreated++;
+            } else {
+              linkBatch.push(link);
+              if (linkBatch.length >= BATCH_SIZE) await flushLinks();
+            }
           }
         }
-      }
 
-      // Timeline
-      if (doTimeline) {
-        const entries = extractTimelineFromContent(content, slug);
-        for (const entry of entries) {
-          if (dryRun) {
-            if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
-            timelineCreated++;
-          } else {
-            timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
-            if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
+        if (doTimeline) {
+          const entries = extractTimelineFromContent(content, slug);
+          for (const entry of entries) {
+            if (dryRun) {
+              if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
+              timelineCreated++;
+            } else {
+              timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+              if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
+            }
           }
         }
-      }
 
-      pagesProcessed++;
-    } catch { /* skip unreadable */ }
-    progress.tick(1);
-  }
+        pagesProcessed++;
+      } catch { /* skip unreadable */ }
+      progress.tick(1);
+    },
+  });
 
   await flushLinks();
   await flushTimeline();
@@ -699,6 +758,8 @@ async function extractForSlugs(
 
 async function extractLinksFromDir(
   engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
+  // v0.41.15.0 (T7): in-process worker count. Default 1.
+  workers: number = 1,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
@@ -734,25 +795,30 @@ async function extractLinksFromDir(
     }
   }
 
-  for (let i = 0; i < files.length; i++) {
-    try {
-      const content = readFileSync(files[i].path, 'utf-8');
-      const links = await extractLinksFromFile(content, files[i].relPath, allSlugs);
-      for (const link of links) {
-        if (dryRunSeen) {
-          const key = `${link.from_slug}::${link.to_slug}::${link.link_type}`;
-          if (dryRunSeen.has(key)) continue;
-          dryRunSeen.add(key);
-          if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
-          created++;
-        } else {
-          batch.push(link);
-          if (batch.length >= BATCH_SIZE) await flush();
+  await runSlidingPool({
+    items: files,
+    workers,
+    failureLabel: (f) => f.relPath,
+    onItem: async (file) => {
+      try {
+        const content = readFileSync(file.path, 'utf-8');
+        const links = await extractLinksFromFile(content, file.relPath, allSlugs);
+        for (const link of links) {
+          if (dryRunSeen) {
+            const key = `${link.from_slug}::${link.to_slug}::${link.link_type}`;
+            if (dryRunSeen.has(key)) continue;
+            dryRunSeen.add(key);
+            if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
+            created++;
+          } else {
+            batch.push(link);
+            if (batch.length >= BATCH_SIZE) await flush();
+          }
         }
-      }
-    } catch { /* skip unreadable */ }
-    progress.tick(1);
-  }
+      } catch { /* skip unreadable */ }
+      progress.tick(1);
+    },
+  });
   await flush();
   progress.finish();
 
@@ -765,6 +831,8 @@ async function extractLinksFromDir(
 
 async function extractTimelineFromDir(
   engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
+  // v0.41.15.0 (T7): in-process worker count. Default 1.
+  workers: number = 1,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
 
@@ -795,25 +863,30 @@ async function extractTimelineFromDir(
     }
   }
 
-  for (let i = 0; i < files.length; i++) {
-    try {
-      const content = readFileSync(files[i].path, 'utf-8');
-      const slug = pathToSlug(files[i].relPath);
-      for (const entry of extractTimelineFromContent(content, slug)) {
-        if (dryRunSeen) {
-          const key = `${entry.slug}::${entry.date}::${entry.summary}`;
-          if (dryRunSeen.has(key)) continue;
-          dryRunSeen.add(key);
-          if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
-          created++;
-        } else {
-          batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
-          if (batch.length >= BATCH_SIZE) await flush();
+  await runSlidingPool({
+    items: files,
+    workers,
+    failureLabel: (f) => f.relPath,
+    onItem: async (file) => {
+      try {
+        const content = readFileSync(file.path, 'utf-8');
+        const slug = pathToSlug(file.relPath);
+        for (const entry of extractTimelineFromContent(content, slug)) {
+          if (dryRunSeen) {
+            const key = `${entry.slug}::${entry.date}::${entry.summary}`;
+            if (dryRunSeen.has(key)) continue;
+            dryRunSeen.add(key);
+            if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
+            created++;
+          } else {
+            batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+            if (batch.length >= BATCH_SIZE) await flush();
+          }
         }
-      }
-    } catch { /* skip unreadable */ }
-    progress.tick(1);
-  }
+      } catch { /* skip unreadable */ }
+      progress.tick(1);
+    },
+  });
   await flush();
   progress.finish();
 

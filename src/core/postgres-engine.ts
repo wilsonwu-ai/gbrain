@@ -2956,6 +2956,10 @@ export class PostgresEngine implements BrainEngine {
     const embedding = input.embedding ?? null;
     const embeddedAt = embedding ? new Date() : null;
     const embedLit = embedding ? toPgVectorLiteral(embedding) : null;
+    // v0.41.15.0 (T6, codex #20): match cast to actual column type so
+    // a halfvec(N) column doesn't pay an implicit-cast round-trip + can
+    // run on pgvector versions that lack the auto vector→halfvec cast.
+    const castSuffix = await this.resolveFactsEmbeddingCast();
     // v0.35.4 (D-CDX-5) — typed-claim columns. All four nullable.
     const claimMetric = input.claim_metric ?? null;
     const claimValue  = input.claim_value  ?? null;
@@ -2978,7 +2982,7 @@ export class PostgresEngine implements BrainEngine {
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
-            ${embedLit === null ? null : tx.unsafe(`'${embedLit}'::vector`)}, ${embeddedAt},
+            ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
             ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
           ) RETURNING id
         `;
@@ -3004,7 +3008,7 @@ export class PostgresEngine implements BrainEngine {
         ) VALUES (
           ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
           ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
-          ${embedLit === null ? null : tx.unsafe(`'${embedLit}'::vector`)}, ${embeddedAt},
+          ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
           ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
         ) RETURNING id
       `;
@@ -3024,6 +3028,59 @@ export class PostgresEngine implements BrainEngine {
     return (result.count ?? 0) > 0;
   }
 
+  /**
+   * v0.41.15.0 (T6, codex #20): per-process cache for the
+   * `facts.embedding` cast suffix. Migration v40 creates the column as
+   * `halfvec(N)` on pgvector >= 0.7 but falls back to `vector(N)` on
+   * older. The pre-v0.41.15 insert path always cast embeddings as
+   * `::vector`, which works via implicit cast on pgvector >= 0.7 but
+   * is honest-only when the column actually IS vector. Probing once
+   * per process + caching the suffix lets the insert match the column
+   * type exactly. Initialized lazily in `insertFacts`.
+   */
+  private _factsEmbeddingCastSuffix: '::vector' | '::halfvec' | null = null;
+
+  /** Test seam: clear the cached cast suffix so tests can re-probe. */
+  __resetFactsEmbeddingCastCacheForTest(): void {
+    this._factsEmbeddingCastSuffix = null;
+  }
+
+  private async resolveFactsEmbeddingCast(): Promise<'::vector' | '::halfvec'> {
+    if (this._factsEmbeddingCastSuffix !== null) return this._factsEmbeddingCastSuffix;
+    const sql = this.sql;
+    try {
+      const rows = await sql<Array<{ formatted: string | null }>>`
+        SELECT format_type(a.atttypid, a.atttypmod) AS formatted
+          FROM pg_attribute a
+          JOIN pg_class c ON c.oid = a.attrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'public'
+           AND c.relname = 'facts'
+           AND a.attname = 'embedding'
+           AND NOT a.attisdropped
+      `;
+      const formatted = rows?.[0]?.formatted ?? null;
+      // halfvec match first — halfvec contains "vec" so a /vector/i
+      // regex would shadow it. See readFactsEmbeddingDim's identical
+      // ordering note.
+      if (formatted && /halfvec\(\d+\)/i.test(formatted)) {
+        this._factsEmbeddingCastSuffix = '::halfvec';
+      } else {
+        // Default to '::vector' (the pre-v0.41.15 behavior). On a brain
+        // without the facts.embedding column yet (pre-v40), the cast
+        // suffix is irrelevant — the INSERT would fail elsewhere
+        // anyway. Caching the default still saves the SELECT on
+        // subsequent inserts.
+        this._factsEmbeddingCastSuffix = '::vector';
+      }
+    } catch {
+      // Probe failed — fall back to '::vector' default. Cache so we
+      // don't re-probe on every insert.
+      this._factsEmbeddingCastSuffix = '::vector';
+    }
+    return this._factsEmbeddingCastSuffix;
+  }
+
   async insertFacts(
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string }>,
     ctx: { source_id: string },
@@ -3031,6 +3088,10 @@ export class PostgresEngine implements BrainEngine {
     if (rows.length === 0) return { inserted: 0, ids: [] };
 
     const sql = this.sql;
+    // v0.41.15.0 (T6, codex #20): resolve the embedding-cast suffix
+    // ONCE per process so the cast matches the actual column type
+    // (halfvec vs vector). The probe is cached after first call.
+    const castSuffix = await this.resolveFactsEmbeddingCast();
     // Single transaction so the v51 partial UNIQUE index can roll back
     // the whole batch on constraint violation. Per-row INSERTs (not
     // multi-row VALUES) keep the embedding-vs-no-embedding branching
@@ -3071,7 +3132,7 @@ export class PostgresEngine implements BrainEngine {
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
-            ${embedLit === null ? null : tx.unsafe(`'${embedLit}'::vector`)}, ${embeddedAt},
+            ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
             ${input.row_num}, ${input.source_markdown_slug},
             ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
             ${eventType}

@@ -8,6 +8,7 @@ import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
 import { loadConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
 import { filterOutEmbedSkipped } from '../core/embed-skip.ts';
+import { runSlidingPool } from '../core/worker-pool.ts';
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -450,21 +451,19 @@ async function embedAll(
     onProgress?.(processed, pages.length, result.embedded);
   }
 
-  // Sliding worker pool: N workers share a queue and each pulls the
-  // next page as soon as it finishes its current one. This handles
-  // uneven per-page workloads (some pages have 1 chunk, others have 50)
-  // much better than a fixed-window Promise.all, since fast workers
-  // don't wait for slow workers to finish an entire window.
-  let nextIdx = 0;
-  async function worker() {
-    while (nextIdx < pages.length) {
-      const idx = nextIdx++;
-      await embedOnePage(pages[idx]);
-    }
-  }
-
-  const numWorkers = Math.min(CONCURRENCY, pages.length);
-  await Promise.all(Array.from({ length: numWorkers }, () => worker()));
+  // v0.41.15.0: sliding worker pool extracted into src/core/worker-pool.ts.
+  // Throughput characteristics unchanged from the prior inline pool — N
+  // workers atomically claim the next page; the helper is the canonical
+  // primitive. embedOnePage handles its own per-page errors via try/catch
+  // and stderr log (no rethrow), so we don't need failures[] here and
+  // omitting onError means the default 'continue' policy applies cleanly
+  // even though no errors should reach the pool's catch.
+  await runSlidingPool({
+    items: pages,
+    workers: CONCURRENCY,
+    onItem: (page) => embedOnePage(page),
+    failureLabel: (page) => page.slug,
+  });
 
   // Stdout summary preserved for scripts/tests that grep for counts.
   if (dryRun) {
@@ -583,7 +582,6 @@ async function embedAllStale(
       const keys = Array.from(byKey.keys());
       result.total_chunks += batch.length;
 
-      let nextIdx = 0;
       async function embedOneKey(key: string) {
         const stale = byKey.get(key)!;
         const keySourceId = stale[0]?.source_id ?? 'default';
@@ -618,18 +616,18 @@ async function embedAllStale(
         onProgress?.(totalProcessedPages, Math.ceil(staleCount / PAGE_SIZE) * keys.length, result.embedded);
       }
 
-      async function worker() {
-        // D3a: workers check the budget before claiming the next key.
-        // A stuck mid-fetch worker also has the abortSignal threaded into
-        // its embedBatch call, so the in-flight HTTP cancels too.
-        while (nextIdx < keys.length && !budgetSignal.aborted) {
-          const idx = nextIdx++;
-          await embedOneKey(keys[idx]);
-        }
-      }
-
-      const numWorkers = Math.min(CONCURRENCY, keys.length);
-      await Promise.all(Array.from({ length: numWorkers }, () => worker()));
+      // v0.41.15.0: migrated to shared runSlidingPool. The pool checks
+      // its `signal` argument before each claim (mirrors the pre-migration
+      // `!budgetSignal.aborted` gate) AND threads abort into in-flight
+      // onItem via the local-abort composition for D13. embedOneKey
+      // already handles its own per-key errors via try/catch + stderr.
+      await runSlidingPool({
+        items: keys,
+        workers: CONCURRENCY,
+        signal: budgetSignal,
+        onItem: (key) => embedOneKey(key),
+        failureLabel: (key) => key,
+      });
 
       // If we got fewer rows than PAGE_SIZE, we've reached the end.
       if (batch.length < PAGE_SIZE) break;

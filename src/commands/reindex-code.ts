@@ -33,6 +33,10 @@ import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
 import { withBudgetTracker } from '../core/ai/gateway.ts';
+// v0.41.15.0 (T11, D9): per-batch parallel workers. BudgetExhausted
+// auto-aborts via the worker-pool's D13 bypass.
+import { runSlidingPool } from '../core/worker-pool.ts';
+import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 
 export interface ReindexCodeOpts {
   sourceId?: string;
@@ -52,6 +56,14 @@ export interface ReindexCodeOpts {
    * imported, the throw aborts the remaining batch).
    */
   maxCostUsd?: number;
+  /**
+   * v0.41.15.0 (T11, D9): per-batch parallel workers. Default 1.
+   * PGLite clamps to 1. Recommended 4-8 for large code corpora.
+   * BudgetExhausted from any worker aborts the pool via the worker-
+   * pool's D13 bypass — the budget cap stays load-bearing under
+   * concurrency.
+   */
+  workers?: number;
 }
 
 export interface ReindexCodeResult {
@@ -248,56 +260,40 @@ export async function runReindexCode(
   // then surface the throw as a partial-progress result the caller can
   // re-run. importCodeFile is idempotent (content_hash short-circuit), so
   // a re-run picks up where the cap fired.
-  // v0.41.13.0 T12 retrofit: route through progressive-batch primitive
-  // for audit JSONL + stage telemetry. Cost gating + BudgetTracker scope
-  // are unchanged (this site already has full BudgetTracker integration);
-  // primitive observes via getCurrentBudgetTracker so the existing
-  // withBudgetTracker scope at line 304 still drives the cap. Per D21,
-  // `interactiveAbortMs: 0` preserves behavior (no Ctrl-C grace today).
   const reindexBody = async (): Promise<void> => {
     try {
-      // Buffer all pending rows into the work list. Worst case is bounded
-      // by `fetchCodePages` natural pagination; for triage --limit caps
-      // total work and full sweeps already accept the memory cost.
-      const workList: Array<Awaited<ReturnType<typeof fetchCodePages>>[number]> = [];
       while (true) {
         const batch = await fetchCodePages(engine, opts.sourceId, batchSize, offset);
         if (batch.length === 0) break;
-        workList.push(...batch);
-        offset += batch.length;
-        if (batch.length < batchSize) break;
-      }
 
-      const { retrofitWrap } = await import('../core/progressive-batch/retrofit-wrap.ts');
-      const pbResult = await retrofitWrap({
-        label: 'reindex.code',
-        items: workList,
-        // Per-item cost defers to BudgetTracker; this is just the
-        // primitive's projection signal for the audit JSONL.
-        costPerItem: opts.noEmbed ? 0 : 0.0001,
-        // requireBudgetSafetyNet=false because BudgetTracker is set up
-        // outside this scope when --max-cost is passed.
-        requireBudgetSafetyNet: false,
-        runner: async (rows) => {
-          let succeeded = 0;
-          let runnerFailed = 0;
-          let stageCost = 0;
-          for (const row of rows) {
+        // v0.41.15.0 (T11): per-batch sliding pool. BudgetExhausted
+        // from any worker propagates up via the helper's D13 bypass
+        // (not caught here) so the outer catch can record partial
+        // progress unchanged.
+        const writersResolved = resolveWorkersWithClamp(
+          engine,
+          opts.workers,
+          'reindex-code',
+          batch.length,
+        );
+        await runSlidingPool({
+          items: batch,
+          workers: writersResolved.workers,
+          failureLabel: (row) => row.slug,
+          onItem: async (row) => {
             const fm = row.frontmatter ?? {};
             const relPath = typeof fm.file === 'string' ? fm.file : null;
             if (!relPath) {
               failed++;
-              runnerFailed++;
               failures.push({ slug: row.slug, error: 'missing frontmatter.file' });
               reporter.tick();
-              continue;
+              return;
             }
             if (!row.compiled_truth) {
               failed++;
-              runnerFailed++;
               failures.push({ slug: row.slug, error: 'missing compiled_truth' });
               reporter.tick();
-              continue;
+              return;
             }
             try {
               const result = await importCodeFile(engine, relPath, row.compiled_truth, {
@@ -305,33 +301,26 @@ export async function runReindexCode(
                 force: opts.force,
                 sourceId: opts.sourceId,
               });
-              if (result.status === 'imported') {
-                reindexed++;
-                succeeded++;
-                stageCost += opts.noEmbed ? 0 : 0.0001;
-              } else if (result.status === 'skipped') {
-                skipped++;
-                succeeded++;
-              } else {
+              if (result.status === 'imported') reindexed++;
+              else if (result.status === 'skipped') skipped++;
+              else {
                 failed++;
-                runnerFailed++;
                 failures.push({ slug: row.slug, error: result.error ?? result.status });
               }
             } catch (e: unknown) {
+              // BudgetExhausted bypasses the helper's onError and hard-
+              // aborts the pool (D13). All other errors are captured
+              // per-page so the rest of the batch completes.
               if (e instanceof BudgetExhausted) throw e;
               failed++;
-              runnerFailed++;
               failures.push({ slug: row.slug, error: e instanceof Error ? e.message : String(e) });
             }
             reporter.tick();
-          }
-          return { succeeded, failed: runnerFailed, costUsd: stageCost };
-        },
-      });
-      if (pbResult.abortedAt) {
-        process.stderr.write(
-          `[reindex-code] aborted at stage=${pbResult.abortedAt.stage} reason=${pbResult.abortedAt.reason ?? pbResult.abortedAt.verdict}\n`,
-        );
+          },
+        });
+
+        offset += batch.length;
+        if (batch.length < batchSize) break;
       }
     } finally {
       reporter.finish();
@@ -401,6 +390,20 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
   const force = args.includes('--force');
   const noEmbed = args.includes('--no-embed');
 
+  // v0.41.15.0 (T11, D9): --workers N for per-batch parallelism.
+  let workers: number | undefined;
+  const workersIdx = args.indexOf('--workers');
+  const concurrencyIdx = args.indexOf('--concurrency');
+  const workersValIdx = workersIdx >= 0 ? workersIdx + 1 : (concurrencyIdx >= 0 ? concurrencyIdx + 1 : -1);
+  if (workersValIdx > 0 && workersValIdx < args.length) {
+    try {
+      workers = parseWorkers(args[workersValIdx]);
+    } catch (e) {
+      console.error((e as Error).message);
+      process.exit(2);
+    }
+  }
+
   // F3: --max-cost / --max-cost-usd both accepted for symmetry with brainstorm.
   let maxCostUsd: number | undefined;
   for (const flag of ['--max-cost', '--max-cost-usd']) {
@@ -418,7 +421,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
   }
 
   if (dryRun) {
-    const result = await runReindexCode(engine, { sourceId, dryRun: true, yes, json, force, noEmbed, maxCostUsd });
+    const result = await runReindexCode(engine, { sourceId, dryRun: true, yes, json, force, noEmbed, maxCostUsd, workers });
     if (json) {
       console.log(JSON.stringify(result));
     } else {
@@ -471,7 +474,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
     }
   }
 
-  const result = await runReindexCode(engine, { sourceId, yes, json, force, noEmbed, maxCostUsd });
+  const result = await runReindexCode(engine, { sourceId, yes, json, force, noEmbed, maxCostUsd, workers });
   if (json) {
     console.log(JSON.stringify(result));
   } else {

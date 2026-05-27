@@ -1379,8 +1379,18 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'reindex': {
         if (args.includes('--multimodal')) {
           const { runReindexMultimodal } = await import('./commands/reindex-multimodal.ts');
+          const { parseWorkers } = await import('./core/sync-concurrency.ts');
           const limitIdx = args.indexOf('--limit');
           const limitVal = limitIdx >= 0 && limitIdx + 1 < args.length ? parseInt(args[limitIdx + 1], 10) : undefined;
+          // v0.41.15.0 (T9, D9): --workers N for parallel UPDATEs within
+          // each Voyage batch. Honored by the inner write loop only;
+          // the outer batch loop is one Voyage round-trip per batch.
+          const workersIdx = args.indexOf('--workers');
+          const concurrencyIdx = args.indexOf('--concurrency');
+          const workersValIdx = workersIdx >= 0 ? workersIdx + 1 : (concurrencyIdx >= 0 ? concurrencyIdx + 1 : -1);
+          const workers = workersValIdx > 0 && workersValIdx < args.length
+            ? parseWorkers(args[workersValIdx])
+            : undefined;
           const result = await runReindexMultimodal(engine, {
             limit: Number.isFinite(limitVal as number) ? (limitVal as number) : undefined,
             dryRun: args.includes('--dry-run'),
@@ -1388,6 +1398,7 @@ async function handleCliOnly(command: string, args: string[]) {
             noEmbed: args.includes('--no-embed'),
             json: args.includes('--json'),
             yes: args.includes('--yes'),
+            workers,
           });
           if (args.includes('--json')) {
             console.log(JSON.stringify(result, null, 2));

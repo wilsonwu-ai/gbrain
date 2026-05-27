@@ -1243,6 +1243,10 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
       segmentLimit: typeof job.data.segmentLimit === 'number' ? job.data.segmentLimit : undefined,
       maxCostUsd: typeof job.data.maxCostUsd === 'number' ? job.data.maxCostUsd : undefined,
       overrideDisabled: !!job.data.overrideDisabled,
+      // v0.41.15.0 (D9): round-trip --workers via job.data.workers so
+      // `gbrain extract-conversation-facts --background --workers 20`
+      // works end-to-end.
+      workers: typeof job.data.workers === 'number' ? job.data.workers : undefined,
     });
     return result;
   });

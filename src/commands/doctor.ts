@@ -1408,6 +1408,108 @@ export async function checkEmbeddingWidthConsistency(engine: BrainEngine): Promi
 }
 
 /**
+ * v0.41.15.0 (T6, codex #19/#20) — facts.embedding column drift check.
+ *
+ * Parallel surface to `checkEmbeddingWidthConsistency` but for the
+ * facts table. Migration v40 creates `facts.embedding` from
+ * `config.embedding_dimensions` AT MIGRATION TIME — if the user later
+ * swaps embedding providers (e.g. OpenAI 1536 → zembed-1 1280) without
+ * re-running migrations, the column width drifts. The first insert
+ * dies with the opaque pgvector "expected vector(N), got vector(M)"
+ * error.
+ *
+ * Covers BOTH vector(N) AND halfvec(N) shapes (codex #19 — v40 falls
+ * back to vector on pgvector < 0.7). Surfaces the paste-ready DROP
+ * INDEX → ALTER USING → CREATE INDEX recipe from
+ * `buildFactsAlterRecipe` instead of the unsafe REINDEX-only path
+ * codex #18 caught in the original plan.
+ */
+export async function checkFactsEmbeddingWidthConsistency(engine: BrainEngine): Promise<Check> {
+  // PGLite ships a single pgvector version; column + config wire
+  // together at initSchema time. No possible drift.
+  if (engine.kind !== 'postgres') {
+    return {
+      name: 'facts_embedding_width_consistency',
+      status: 'ok',
+      message: 'Skipped on PGLite (single bundled pgvector version).',
+    };
+  }
+
+  try {
+    const {
+      readFactsEmbeddingDim,
+      buildFactsAlterRecipe,
+    } = await import('../core/embedding-dim-check.ts');
+
+    const col = await readFactsEmbeddingDim(engine);
+    if (!col.exists) {
+      return {
+        name: 'facts_embedding_width_consistency',
+        status: 'ok',
+        message: 'facts.embedding column not present (pre-v40 brain or migration pending).',
+      };
+    }
+    if (col.dims === null || col.columnType === null) {
+      return {
+        name: 'facts_embedding_width_consistency',
+        status: 'warn',
+        message: 'facts.embedding column type is unrecognized (not vector or halfvec). Schema may be corrupt.',
+      };
+    }
+
+    let configDim: number;
+    let resolvedModel = 'unknown';
+    try {
+      const { getEmbeddingDimensions, getEmbeddingModel } = await import('../core/ai/gateway.ts');
+      configDim = getEmbeddingDimensions();
+      resolvedModel = getEmbeddingModel();
+    } catch {
+      return {
+        name: 'facts_embedding_width_consistency',
+        status: 'ok',
+        message: 'gateway not configured — facts.embedding width check skipped.',
+      };
+    }
+    if (!Number.isFinite(configDim) || configDim <= 0) {
+      return {
+        name: 'facts_embedding_width_consistency',
+        status: 'warn',
+        message: `gateway returned non-positive embedding dimension "${configDim}".`,
+      };
+    }
+
+    if (col.dims === configDim) {
+      return {
+        name: 'facts_embedding_width_consistency',
+        status: 'ok',
+        message:
+          `facts.embedding is ${col.columnType}(${col.dims}) — matches gateway embedding_dimensions ` +
+          `(${resolvedModel}).`,
+      };
+    }
+
+    // Drift detected. Surface the paste-ready ALTER recipe.
+    const recipe = buildFactsAlterRecipe(col.dims, configDim, col.columnType);
+    return {
+      name: 'facts_embedding_width_consistency',
+      status: 'warn',
+      message:
+        `facts.embedding is ${col.columnType}(${col.dims}) but gateway resolved ` +
+        `embedding_dimensions = ${configDim} (${resolvedModel}). ` +
+        `New fact inserts will fail with an opaque pgvector error.\n\n` +
+        recipe,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'facts_embedding_width_consistency',
+      status: 'warn',
+      message: `Could not check facts.embedding width: ${msg}`,
+    };
+  }
+}
+
+/**
  * v0.32.3 [CDX-20]: surface mode + per-key override drift.
  *
  * Status stays `ok` (never warns; never docks health score). If
@@ -5200,6 +5302,10 @@ export async function buildChecks(
     checks.push(await checkZeEmbeddingHealth(engine));
     progress.heartbeat('embedding_width_consistency');
     checks.push(await checkEmbeddingWidthConsistency(engine));
+    // v0.41.15.0 (T6, codex #19/#20) — facts.embedding column drift
+    // parity check. Same drift class as content_chunks, separate column.
+    progress.heartbeat('facts_embedding_width_consistency');
+    checks.push(await checkFactsEmbeddingWidthConsistency(engine));
 
     // v0.37.7.0 doctor checks (#1167, #1166, #1226) — fast-mode skipped
     // since these touch DB queries with cost on large brains.

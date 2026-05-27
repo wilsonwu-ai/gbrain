@@ -1,5 +1,98 @@
 # TODOS
 
+## v0.41.17.0 `--workers N` cathedral follow-ups (v0.41.18+)
+
+These were filed during the ship of `garrytan/dar-es-salaam-v1`
+(PR #1473 productionization). The wave landed seven `--workers N`
+surfaces + the shared worker-pool helper + facts dim doctor parity.
+The follow-ups below are scope deliberately deferred from v0.41.17.0
+per /plan-eng-review D-decisions.
+
+- [ ] **v0.41.18+: dream execution-concurrency knob via queue-layer
+  recoupling** (D21). Today the only knob that controls how many dream
+  subagents run concurrently is `gbrain jobs work --concurrency N` —
+  a process-wide setting, not per-invocation. A user running
+  `gbrain dream` who wants 5 concurrent synthesize subagents has no
+  way to express that without changing the queue daemon's global cap.
+  v0.41.17.0 dropped `dream --workers` from scope (D14) because the
+  obvious naming would only bound submit rate, not actual execution.
+  The proper fix is a queue-side primitive ("temporarily clamp
+  concurrency to N for jobs tagged with X") and a new
+  `gbrain dream --execution-concurrency N` flag that uses it.
+  Multi-wave design; touches `MinionQueue.claim` semantics. File when
+  someone asks.
+- [ ] **v0.41.18+: auto-tune `--workers` from observed rate-limit
+  headers** (D19). Instead of operator picking `--workers N` manually,
+  the worker pool observes 429s / Retry-After in gateway responses and
+  AIMD-style auto-tunes to stay just under the provider's actual cap.
+  Removes operator-tuning burden; matches industry standard adaptive
+  concurrency control. Needs new instrumentation in
+  `src/core/ai/gateway.ts` to surface rate-limit-header signal, plus
+  a shared 'observed concurrency cap' state across worker-pool callers.
+  The RFC (PR #1473) explicitly punted this with "start manual,
+  observe before auto-pick" — file when we have multiple weeks of
+  real-world `--workers` usage data to inform the auto-tune curve.
+- [ ] **v0.41.18+: per-tracker mutex on `BudgetTracker.reserve()`** (D20).
+  v0.41.17.0 D3 chose to document the worst-case overshoot
+  (`N_workers × avg_per_call_cost` over the cap) rather than mutex
+  `reserve()` because the overshoot is single-digit dollars at any
+  realistic `--max-cost-usd`. The structural fix is a per-instance
+  async-mutex around `reserve()` so the check-and-reserve becomes
+  atomic across concurrent callers. Cost: ~1ms per claim on a primitive
+  used by 5+ call sites including the hot embed path. File when
+  someone reports overshoot or wants exact-ceiling compliance for
+  paid-API tracking.
+- [ ] **v0.41.18+: `extractLinksForSlugs` + `extractTimelineForSlugs`
+  sync-integration hooks get `--workers N` parity.** T7 wired
+  `--workers` into the CLI-facing `extract` paths (extractForSlugs,
+  extractLinksFromDir, extractTimelineFromDir) but left the two
+  sync-integration hooks in extract.ts:883/914 serial. Those are
+  called from sync.ts post-sync and would benefit from the same
+  fan-out shape. Mechanical change; mirror the runSlidingPool
+  conversion from T7.
+- [ ] **v0.41.18+: extract DB-source loops (`extractLinksFromDB`,
+  `extractTimelineFromDB`, `extractMentionsFromDb`) get `--workers N`.**
+  T7 explicitly scoped the workers wiring to fs-walk inner loops; the
+  DB-source paths use the engine's own pagination and stay serial.
+  Wire when an operator hits perf issues running `gbrain extract
+  --source db` on a large brain.
+- [ ] **v0.41.18+: deeper `resolveSymbolEdgesIncremental` intra-source
+  parallelism.** T8 wired `--workers N` for the cross-source loop
+  under `--all-sources` only. The inner per-batch loop inside
+  `resolveSymbolEdgesIncremental` (200 chunks per batch, sequential)
+  is the larger throughput lever and stays serial in v0.41.17.0.
+  Touches the symbol-resolver core; defer until the next chunker
+  refactor wave.
+- [ ] **v0.41.18+: re-compose progressive-batch + workers on the 3 reindex
+  sites.** v0.41.17.0 merged master's v0.41.16.0 progressive-batch retrofit
+  for `reindex.ts`, `reindex-multimodal.ts`, `reindex-code.ts` AGAINST this
+  wave's `--workers N` retrofit on the same files. The merge took ours
+  (workers) because `--workers` is the load-bearing user-facing feature in
+  this wave; master's progressive-batch primitive at
+  `src/core/progressive-batch/` still ships unchanged. The two layers are
+  orthogonal at the semantic level: each ramp stage could call
+  `runSlidingPool` to fan its items across N workers. v0.41.18+ wave: wrap
+  the workers fan-out inside the progressive-batch outer ramp on each of
+  the 3 reindex sites. Test parity: ramp + workers together produces the
+  same final state as either alone on a fresh corpus. Reference: master's
+  PR #1510 commit on the same files for the progressive-batch primitive
+  call site; this wave's PR #1519 for the workers call site.
+- [ ] **v0.41.18+: `reindex-frontmatter` worker pool actually parallelizes
+  the underlying `backfillEffectiveDate` library.** T12 added the
+  `--workers N` flag for API consistency but the underlying library
+  doesn't honor it (work is pure CPU date-precedence resolution, no
+  I/O per row). Speedup would be marginal anyway. File only if a real
+  operator complaint surfaces; otherwise leave as informational.
+- [ ] **v0.42+: reactive auto-ALTER on facts dim drift** (D18 — was
+  explicitly skipped). v0.41.17.0 ships doctor warn + extraction
+  preflight (D15) with a paste-ready DROP INDEX + ALTER USING +
+  CREATE INDEX recipe. The structural fix is auto-running the recipe
+  on connect when drift is detected. ALTER on a 100M+ row facts table
+  is hours-long and locks the table; doing it silently would horror-
+  show production brains. v0.42+ design needs a confirmation prompt +
+  maintenance-window UX. Don't file as P0 — doctor + preflight is
+  enough for most users.
+
 ## v0.41.16.0 conversation parser + progressive-batch follow-ups (v0.41.14.0+)
 
 The v0.41.16.0 cathedral shipped the parser primitive + progressive-batch
@@ -93,6 +186,7 @@ PR bisectable.
   Real edge cases (long pastes, code blocks, replies, day-separators)
   only surface in real corpora. Adds ~30min scrub step + privacy
   guard maintenance. Priority: P2.
+
 ## v0.41.15.0 sync-reliability follow-ups (v0.42+)
 
 - [ ] **v0.42+: subprocess fan-out for `sync --all` (`--independent` mode
@@ -2033,7 +2127,8 @@ After the sweep, both should be fixable and renameable back to plain `*.test.ts`
 
 **Context:**
 - Reproduced live during plan verification on 2026-04-29. Previous `multi-source.test.ts` failure killed the script before postgres-bootstrap, postgres-jsonb, etc. could run.
-- Likely fix: replace `echo "$output"` with `printf '%s\n' "$output"`, or write `$output` to a tmpfile and `cat` it (handles large blobs better than echo over pipes), or pipe through `stdbuf -o0`.
+- Likely fix: replace `echo "$output"` with `printf '%s
+' "$output"`, or write `$output` to a tmpfile and `cat` it (handles large blobs better than echo over pipes), or pipe through `stdbuf -o0`.
 - Don't suppress the postgres NOTICE flood at the test layer — that's separate; here we just want the script to not die when bun's stderr is verbose.
 
 **Effort:** S (human or CC: ~10 min).
@@ -2979,7 +3074,8 @@ iteration's residuals.
 
 **Cons:** Touches every existing `executeRaw` call site (~25). Requires careful audit — accidentally tagging a mutation as idempotent re-introduces the phantom-write bug.
 
-**Context:** Codex F3 demonstrated that `READ_ONLY_PREFIX = /^(\s|--.*\n)*(SELECT|WITH)\b/i` is unsound — `WITH x AS (UPDATE … RETURNING …) SELECT …` matches the prefix but updates a row; `SELECT pg_advisory_xact_lock(...)` is a SELECT with side effects. The plan-eng-review wrap-up in `~/.claude/plans/system-instruction-you-are-working-tender-horizon.md` has the full discussion.
+**Context:** Codex F3 demonstrated that `READ_ONLY_PREFIX = /^(\s|--.*
+)*(SELECT|WITH)/i` is unsound — `WITH x AS (UPDATE … RETURNING …) SELECT …` matches the prefix but updates a row; `SELECT pg_advisory_xact_lock(...)` is a SELECT with side effects. The plan-eng-review wrap-up in `~/.claude/plans/system-instruction-you-are-working-tender-horizon.md` has the full discussion.
 
 **Effort estimate:** M (human: ~1 day / CC: ~30 min including call-site audit).
 **Priority:** P2 — current behavior (no retry, supervisor recovers within ~3 min) is acceptable but per-call recovery is a real ergonomic win.

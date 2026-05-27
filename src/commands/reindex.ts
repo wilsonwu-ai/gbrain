@@ -28,18 +28,9 @@ import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { existsSync } from 'fs';
 import { resolve } from 'path';
-// v0.41.13.0: T11 retrofit onto src/core/progressive-batch/ primitive.
-// Per D21: this site previously had no ramp (called from
-// post-upgrade-reembed which owns its own 10s grace). NoopVerifier +
-// `interactiveAbortMs: 0` preserves behavior; the primitive's audit
-// JSONL + cost-cap gate is the value-add. Operators opt INTO ramp
-// via `GBRAIN_PROGRESSIVE_BATCH_STAGES=10,100,500`.
-import {
-  runProgressiveBatch,
-  type NoopVerifier,
-  type Policy,
-  type StageRunner,
-} from '../core/progressive-batch/orchestrator.ts';
+// v0.41.15.0 (T10, D9): per-batch parallel workers.
+import { runSlidingPool } from '../core/worker-pool.ts';
+import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 
 interface ReindexOpts {
   /** Cap total pages reindexed. Useful for triage runs on huge brains. */
@@ -56,6 +47,13 @@ interface ReindexOpts {
    * Useful for offline / no-API-key brains and for tests.
    */
   noEmbed?: boolean;
+  /**
+   * v0.41.15.0 (T10, D9): in-process per-batch parallel workers.
+   * Default 1. PGLite clamps to 1. Recommended 4-8 for large brains.
+   * Each worker calls importFromFile / importFromContent independently;
+   * the counters (reindexed/skipped/failed) are JS-single-thread atomic.
+   */
+  workers?: number;
 }
 
 export interface ReindexResult {
@@ -80,6 +78,10 @@ function parseArgs(args: string[]): ReindexOpts {
       if (Number.isFinite(v) && v > 0) out.limit = v;
     } else if (a === '--repo') {
       out.repoPath = args[++i];
+    } else if (a === '--workers' || a === '--concurrency') {
+      // v0.41.15.0 (T10, D9): per-batch parallel workers.
+      const v = parseInt(args[++i] ?? '', 10);
+      if (Number.isFinite(v) && v >= 1) out.workers = v;
     }
   }
   return out;
@@ -180,107 +182,58 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   let reindexed = 0;
   let skipped = 0;
   let failed = 0;
+  const BATCH = 100;
   const repoPath = opts.repoPath ? resolve(opts.repoPath) : null;
 
-  // v0.41.13.0 T11 retrofit: build the work list, then route through the
-  // progressive-batch primitive. Per D21, this site previously had no
-  // ramp gating (the legacy 10s Ctrl-C grace lived in
-  // post-upgrade-reembed which CALLS this function); keep that behavior
-  // parity by setting `interactiveAbortMs: 0`. Operators opt INTO ramp
-  // via `GBRAIN_PROGRESSIVE_BATCH_STAGES=10,100,500` env override.
-  const workList: Array<{
-    slug: string;
-    source_path: string | null;
-    compiled_truth: string;
-    source_id: string;
-  }> = [];
-  // Read the full target into memory; for triage sweeps the limit is
-  // capped and for full sweeps a 50K-page brain at ~2KB/row = ~100MB
-  // is acceptable. Codex outside-voice would catch this if it became
-  // a bottleneck.
-  {
-    let remaining = target;
-    while (remaining > 0) {
-      const batchSize = Math.min(100, remaining);
-      const batch = await readBatch(engine, batchSize);
-      if (batch.length === 0) break;
-      // Cap re-reads: if a partial sweep already bumped chunker_version
-      // for these rows, readBatch returns the NEXT pending set. Take
-      // exactly `batchSize` from each round to avoid double-counting.
-      workList.push(...batch.slice(0, batchSize));
-      remaining -= batch.length;
-      if (batch.length < batchSize) break;
-    }
-  }
+  while (reindexed + skipped + failed < target) {
+    const remaining = target - (reindexed + skipped + failed);
+    const batchSize = Math.min(BATCH, remaining);
+    const batch = await readBatch(engine, batchSize);
+    if (batch.length === 0) break;
 
-  const verifier: NoopVerifier = {
-    kind: 'noop',
-    // reindex re-chunks via importFromFile/importFromContent which call
-    // OpenAI/Voyage embeddings — cost depends on chars + provider. The
-    // primitive's cost projection uses this number for the cap math;
-    // 0.0001 is a conservative per-row estimate (real cost varies).
-    costPerItem: () => (opts.noEmbed ? 0 : 0.0001),
-  };
-
-  const policy: Policy = {
-    label: 'reindex.markdown',
-    // D21: behavior parity — this site never had Ctrl-C grace. Operators
-    // opt IN via GBRAIN_PROGRESSIVE_BATCH_STAGES env.
-    interactiveAbortMs: 0,
-    // Caller may set a tracker via withBudgetTracker; otherwise this
-    // site has historically been "let it cost what it costs" so we
-    // opt out of the D3 safety-net default.
-    requireBudgetSafetyNet: false,
-  };
-
-  const runner: StageRunner<(typeof workList)[number]> = async (rows) => {
-    let succeeded = 0;
-    let runnerFailed = 0;
-    for (const row of rows) {
-      reporter.tick();
-      try {
-        if (row.source_path && repoPath) {
-          const absPath = resolve(repoPath, row.source_path);
-          if (existsSync(absPath)) {
-            await importFromFile(engine, absPath, row.source_path, {
-              noEmbed: !!opts.noEmbed,
-              sourceId: row.source_id,
-              inferFrontmatter: false,
-              forceRechunk: true,
-            });
-            succeeded++;
-            continue;
-          }
-        }
-        await importFromContent(engine, row.slug, row.compiled_truth, {
-          sourceId: row.source_id,
-          noEmbed: !!opts.noEmbed,
-          forceRechunk: true,
-        });
-        succeeded++;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[reindex] ${row.slug}: ${msg}\n`);
-        runnerFailed++;
-      }
-    }
-    return {
-      succeeded,
-      failed: runnerFailed,
-      costUsd: succeeded * (opts.noEmbed ? 0 : 0.0001),
-    };
-  };
-
-  const pbResult = await runProgressiveBatch(workList, verifier, policy, runner);
-  reindexed = pbResult.itemsProcessed - (pbResult.abortedAt ? 0 : 0);
-  // failed count comes from the runner's per-row catch; the primitive's
-  // error_rate is observed cumulative succeeded/failed and not exposed
-  // directly. We approximate from totals — runner-internal counts win.
-  failed = workList.length - reindexed;
-  if (pbResult.abortedAt) {
-    process.stderr.write(
-      `[reindex] aborted at stage=${pbResult.abortedAt.stage} reason=${pbResult.abortedAt.reason ?? pbResult.abortedAt.verdict}\n`,
+    // v0.41.15.0 (T10, D9): per-batch sliding pool. Counters are JS-
+    // single-thread atomic so reindexed++ / failed++ are race-free
+    // across workers.
+    const writersResolved = resolveWorkersWithClamp(
+      engine,
+      opts.workers,
+      'reindex',
+      batch.length,
     );
+    await runSlidingPool({
+      items: batch,
+      workers: writersResolved.workers,
+      failureLabel: (row) => row.slug,
+      onItem: async (row) => {
+        reporter.tick();
+        try {
+          if (row.source_path && repoPath) {
+            const absPath = resolve(repoPath, row.source_path);
+            if (existsSync(absPath)) {
+              await importFromFile(engine, absPath, row.source_path, {
+                noEmbed: !!opts.noEmbed,
+                sourceId: row.source_id,
+                inferFrontmatter: false,
+                forceRechunk: true,
+              });
+              reindexed++;
+              return;
+            }
+          }
+          // Fallback path: re-chunk stored compiled_truth in place.
+          await importFromContent(engine, row.slug, row.compiled_truth, {
+            sourceId: row.source_id,
+            noEmbed: !!opts.noEmbed,
+            forceRechunk: true,
+          });
+          reindexed++;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`[reindex] ${row.slug}: ${msg}\n`);
+          failed++;
+        }
+      },
+    });
   }
 
   reporter.finish();
