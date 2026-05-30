@@ -1,5 +1,39 @@
 # TODOS
 
+## v0.41.30.0 content-relative staleness follow-ups (v0.42+)
+
+Filed from the v0.41.30.0 wave (supersedes #1623 — commit-relative sync
+staleness). The wave fixes the LOCAL doctor/sources false-SEVERE and the
+REMOTE surfaces via a durable `sources.newest_content_at` column. Two gaps
+were deliberately scoped out (CM2 + the remote post-sync-divergence residual).
+
+- [ ] **v0.42+: lightweight local content-probe phase to keep `newest_content_at` fresh between syncs.**
+  - **What:** an autopilot/cron phase that, for each git-backed source, runs the
+    cheap `git log -1 --format=%ct` (HEAD committer time) and refreshes
+    `sources.newest_content_at` even when there's nothing to sync.
+  - **Why:** the REMOTE staleness path (`doctorReportRemote`'s `checkSyncFreshness`,
+    `federation_health`, the `get_status_snapshot` MCP op) reads the column and
+    cannot shell out to git (v0.41.27.0 trust boundary). The column is written at
+    sync time, so a commit landed AFTER the last sync is invisible to the remote
+    path until the next sync rewrites it — a narrow false-negative window. The
+    authoritative LOCAL cron doctor catches those (it probes live git), so this is
+    a remote-only freshness improvement, not a correctness hole.
+  - **Pros:** shrinks the remote false-negative window to the probe cadence;
+    keeps the trust boundary intact (probe runs on the trusted host, not from a
+    remote caller).
+  - **Cons:** a new background phase + its own tests + a cadence knob; only
+    matters for operators who rely on `gbrain remote doctor` instead of the local
+    cron doctor.
+  - **Context:** the helper already exists — `newestCommitMs(localPath)` in
+    `src/core/source-health.ts`. The phase just calls it per source and UPDATEs
+    the column. See the v0.41.30.0 plan at
+    `~/.claude/plans/system-instruction-you-are-working-vivid-gizmo.md`.
+  - **Also note:** `checkCycleFreshness` was deliberately left on wall-clock in
+    v0.41.30.0 (CM2 — it compares `last_full_cycle_at` via `listAllSources`, a
+    different axis from sync staleness). Content-relativizing it (a source whose
+    newest commit predates its last full cycle doesn't need re-cycling) is a
+    natural companion to this probe phase. Priority: P3.
+
 ## v0.41.29.0 orphan source-scoping follow-ups (v0.42+)
 
 Filed from the v0.41.29.0 wave (bold-name-no-time pattern + orphan_ratio
