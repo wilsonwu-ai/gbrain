@@ -36,9 +36,10 @@ The user wants to:
   cannot be auto-mutated; user passes `--allow-mutate-bundled` or
   `--no-mutate` (default for the dream-cycle phase) writes proposed.md
   for review.
-- **Bootstrap output requires human review.** `--bootstrap-from-routing`
-  writes a sentinel; user must hand-review + delete the sentinel +
-  re-run with `--bootstrap-reviewed` before optimization can use it.
+- **Bootstrap output requires human review.** Both `--bootstrap-from-skill`
+  and `--bootstrap-from-routing` write a sentinel; you must review + STRENGTHEN
+  the generated judges, delete the sentinel, and re-run with
+  `--bootstrap-reviewed` before optimization can use the file.
 
 ## The pipeline
 
@@ -67,51 +68,62 @@ gbrain skillopt <skill-name> [flags]
   └── Final test eval on D_test → run receipt
 ```
 
-## Authoring the benchmark yourself (the common case)
+## Starting a benchmark from the skill itself (the common case)
 
-**The user will NOT hand-write a benchmark. You write it for them.** When the
-user says "make skill X better" and `skills/X/skillopt-benchmark.jsonl` doesn't
-exist, do NOT stop and ask them to author one, and do NOT reach for
-`--bootstrap-from-routing` unless a `routing-eval.jsonl` already exists (it
-generates tasks from ROUTING fixtures, which test dispatch, not output quality).
-Instead, author a quality benchmark from the skill itself:
+**The user will NOT hand-write a benchmark, and you shouldn't start from a blank
+file either.** When the user says "make skill X better" and
+`skills/X/skillopt-benchmark.jsonl` doesn't exist, generate a starter from the
+SKILL.md directly:
 
-1. **Read `skills/X/SKILL.md`.** Identify what the skill is supposed to produce
-   and what "good" looks like — the sections, the must-haves, the length ceiling,
-   whether citations/tool-calls are expected.
-2. **Generate ~15 realistic tasks** covering the cases the skill actually handles
-   (the boring middle, not just edge cases). Each task is the prompt a user would
-   actually send.
-3. **Attach a rule judge to each task** — deterministic, free, no LLM call. Encode
-   what good output requires:
-   - `{"op":"contains","arg":"<must-have substring>"}`
-   - `{"op":"max_chars","arg":<ceiling>}` — punishes padding
-   - `{"op":"min_citations","arg":<n>}` — when sources are expected
-   - `{"op":"section_present","arg":"<heading>"}`, `{"op":"regex","arg":"..."}`,
-     `{"op":"tool_called","arg":"<tool>"}`, `{"op":"tool_not_called","arg":"<tool>"}`
-4. **Write the JSONL** (one task per line) to `skills/X/skillopt-benchmark.jsonl`.
-5. **Run with `--split 1:1:1`** so 15 tasks split a clean 5 train / 5 sel / 5 test.
-   The default `4:1:5` split needs ~50 tasks (sel = N/10, floor 5) and will
-   refuse a smaller benchmark with `D_sel has N task(s) (need >=5)`.
-6. **Dry-run first** (`--dry-run`) to show the user the cost estimate before
-   spending. Then run for real, read the outcome, and report back what changed
-   and the score delta.
+1. **Generate the starter.** Run:
+   ```
+   gbrain skillopt X --bootstrap-from-skill
+   ```
+   One LLM call reads `skills/X/SKILL.md`, infers what the skill produces and what
+   "good" looks like, and writes ~15 tasks (each with rule judges) to
+   `skills/X/skillopt-benchmark.jsonl` plus a `# BOOTSTRAP_PENDING_REVIEW`
+   sentinel. No `routing-eval.jsonl` is needed. Tune the count with
+   `--bootstrap-tasks N` (max 50).
+2. **Review AND STRENGTHEN the judges.** This is YOUR job and it is load-bearing.
+   The generated rule checks are weak drafts — the model tends to emit generic
+   `contains`, loose `max_chars`, or invented headings. Read each task, fix soft
+   checks, add the must-haves the skill actually requires (real section names,
+   real length ceilings, `min_citations` where sources are expected,
+   `tool_called`/`tool_not_called` for tools the skill genuinely uses). A thin
+   benchmark optimizes for a thin definition of quality — do not rubber-stamp.
+3. **Delete the sentinel line** (`# BOOTSTRAP_PENDING_REVIEW`, the last line).
+4. **Run the optimizer with `--split 1:1:1`:**
+   ```
+   gbrain skillopt X --bootstrap-reviewed --split 1:1:1
+   ```
+   The 1:1:1 split is REQUIRED for a 15-task starter — the default `4:1:5` makes
+   the validation set `floor(15/10)=1`, below the `D_sel >= 5` floor, and the
+   optimizer refuses with `d_sel_too_small`. (4:1:5 needs ~50 tasks.) Add
+   `--dry-run` first to preview cost.
 
-Benchmark line shape:
+Benchmark line shape (what the generator writes, one per line):
 ```
 {"task_id":"x-001","task":"<user prompt>","judge":{"kind":"rule","checks":[{"op":"max_chars","arg":1800},{"op":"contains","arg":"agenda"}]}}
 ```
 
-The human walkthrough of this same flow (with a complete 15-task starter) lives
-at `docs/tutorials/improving-skills-with-skillopt.md`. The benchmark IS the
-definition of quality — author it carefully; a thin benchmark optimizes for a
-thin definition.
+Rule-check vocabulary you'll strengthen with: `contains`, `regex`,
+`section_present`, `max_chars`, `min_citations`, `tool_called`, `tool_not_called`.
+Rule judges are deterministic and free, but shallow for skills whose quality is
+sequencing, privacy, refusal boundaries, or file placement — for those, hand-add
+richer checks (or an `llm` judge) during review.
+
+**Fallback — author freehand.** If the generated starter is poor (rare, but
+possible for very behavior-shaped skills), discard it and write the JSONL
+yourself: read the SKILL.md, write ~15 realistic tasks covering the boring middle,
+attach >=2 rule checks each, save to `skills/X/skillopt-benchmark.jsonl`, run with
+`--split 1:1:1`. The human walkthrough lives at
+`docs/tutorials/improving-skills-with-skillopt.md`.
 
 ## Decision tree
 
 | Situation | Action |
 |---|---|
-| Skill has no benchmark | **Author one** (see section above), then `gbrain skillopt foo --split 1:1:1` |
+| Skill has no benchmark | `gbrain skillopt foo --bootstrap-from-skill` → review + strengthen the judges → delete sentinel → `gbrain skillopt foo --bootstrap-reviewed --split 1:1:1` (see section above) |
 | Skill has a `routing-eval.jsonl` and you want a head start | `gbrain skillopt foo --bootstrap-from-routing` → review the generated tasks → `--bootstrap-reviewed` (routing tasks test dispatch; tighten them into quality tasks before trusting) |
 | Iterating on an existing skill | `gbrain skillopt foo --benchmark skills/foo/skillopt-benchmark.jsonl` |
 | Costly run, want preview | Add `--dry-run` |
@@ -136,9 +148,14 @@ When invoked, this skill produces:
   load-bearing; without it, the optimizer accepts noise as improvement.
 - **Don't optimize bundled skills without `--allow-mutate-bundled`.** They
   ship with gbrain and are load-bearing for downstream agents.
-- **Don't use `--bootstrap-from-routing` output without review.** The
-  optimizer model invents success criteria; a human must sanity-check
-  before SkillOpt optimizes against them.
+- **Don't use bootstrap output without strengthening it.** Both
+  `--bootstrap-from-skill` and `--bootstrap-from-routing` have the optimizer
+  model invent success criteria — generic and weak by default. Review and
+  tighten the judges before SkillOpt optimizes against them, or it trains the
+  skill toward benchmark artifacts instead of real quality.
+- **Don't skip `--split 1:1:1` on a ~15-task starter.** The default `4:1:5`
+  split drops the validation set below the `D_sel >= 5` floor and the run
+  aborts with `d_sel_too_small`.
 
 ## Contract
 
