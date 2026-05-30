@@ -958,6 +958,16 @@ export interface BrainEngine {
    */
   countStaleChunks(opts?: { sourceId?: string }): Promise<number>;
   /**
+   * Sum of LENGTH(chunk_text) over stale chunks — the character-count
+   * backlog the embed phase / embed-backfill will process. Sibling of
+   * countStaleChunks (same stale predicate + embed_skip filter + optional
+   * sourceId scope); used by the `gbrain sync --all` cost preview to price
+   * the embedding backlog via estimateCostFromChars. Returns 0 on an
+   * empty/fully-embedded brain. v0.41.30: stale === `embedding IS NULL`;
+   * widened in the same release to also count embedding_signature drift.
+   */
+  sumStaleChunkChars(opts?: { sourceId?: string }): Promise<number>;
+  /**
    * Return every chunk where embedding IS NULL, with the metadata needed
    * to call embedBatch + upsertChunks. The `embedding` column is omitted
    * by design — stale rows have NULL embeddings, so shipping them wastes

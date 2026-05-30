@@ -14,7 +14,12 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { EMBEDDING_COST_PER_1K_TOKENS, estimateEmbeddingCostUsd } from '../src/core/embedding.ts';
+import {
+  EMBEDDING_COST_PER_1K_TOKENS,
+  estimateEmbeddingCostUsd,
+  willEmbedSynchronously,
+  shouldBlockSync,
+} from '../src/core/embedding.ts';
 import { lookupEmbeddingPrice } from '../src/core/embedding-pricing.ts';
 import { estimateTokens } from '../src/core/chunkers/code.ts';
 
@@ -66,6 +71,50 @@ describe('Layer 8 D1 — embedding cost model', () => {
     const cost = estimateEmbeddingCostUsd(400_000);
     expect(cost).toBeGreaterThan(0.04);
     expect(cost).toBeLessThan(0.07);
+  });
+});
+
+describe('v0.41.30 — willEmbedSynchronously (embed-mode resolver)', () => {
+  // Mirrors sync.ts:2346 effectiveNoEmbed = v2 && !serial && !noEmbed ? true : noEmbed.
+  // Embed runs INLINE iff that resolves to false.
+  test('v2 off → inline (legacy synchronous embed)', () => {
+    expect(willEmbedSynchronously({ v2Enabled: false, serialFlag: false, noEmbed: false })).toBe('inline');
+  });
+  test('v2 on + parallel → deferred (backfill jobs)', () => {
+    expect(willEmbedSynchronously({ v2Enabled: true, serialFlag: false, noEmbed: false })).toBe('deferred');
+  });
+  test('v2 on + --serial → inline', () => {
+    expect(willEmbedSynchronously({ v2Enabled: true, serialFlag: true, noEmbed: false })).toBe('inline');
+  });
+  test('--no-embed forces deferred regardless of v2/serial', () => {
+    expect(willEmbedSynchronously({ v2Enabled: false, serialFlag: false, noEmbed: true })).toBe('deferred');
+    expect(willEmbedSynchronously({ v2Enabled: true, serialFlag: true, noEmbed: true })).toBe('deferred');
+  });
+});
+
+describe('v0.41.30 — shouldBlockSync (cost-gate decision)', () => {
+  // R-1: deferred NEVER blocks, even at absurd cost (the headline fix — a
+  // nightly cron over a synced corpus must not exit 2).
+  test('R-1: deferred never blocks, even at $999', () => {
+    expect(shouldBlockSync(999, 0.5, 'deferred')).toBe(false);
+    expect(shouldBlockSync(0, 0.5, 'deferred')).toBe(false);
+  });
+  // R-2: inline still blocks above the floor (protection preserved where
+  // sync actually spends synchronously).
+  test('R-2: inline blocks above floor', () => {
+    expect(shouldBlockSync(0.51, 0.5, 'inline')).toBe(true);
+    expect(shouldBlockSync(130, 0.5, 'inline')).toBe(true);
+  });
+  test('inline at exactly the floor does NOT block (boundary)', () => {
+    expect(shouldBlockSync(0.5, 0.5, 'inline')).toBe(false);
+  });
+  test('inline below floor does not block (kills cents-level cron noise)', () => {
+    expect(shouldBlockSync(0.03, 0.5, 'inline')).toBe(false);
+    expect(shouldBlockSync(0, 0.5, 'inline')).toBe(false);
+  });
+  test('floor of 0 makes inline block on any nonzero cost', () => {
+    expect(shouldBlockSync(0.0001, 0, 'inline')).toBe(true);
+    expect(shouldBlockSync(0, 0, 'inline')).toBe(false);
   });
 });
 

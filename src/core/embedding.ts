@@ -161,3 +161,52 @@ export function currentEmbeddingPricePerMTok(): number {
 export function estimateEmbeddingCostUsd(tokens: number): number {
   return (tokens / 1_000_000) * currentEmbeddingPricePerMTok();
 }
+
+/**
+ * Whether a `gbrain sync --all` invocation will embed at sync time
+ * ('inline') or defer embedding to per-source `embed-backfill` minion jobs
+ * ('deferred'). Under federated_v2 the default path defers; the backfill
+ * jobs carry their own 10-min cooldown + $25/source/24h spend cap, so the
+ * sync-time cost gate only BLOCKS on the inline path. See sync.ts:2346
+ * (`effectiveNoEmbed`) — this mirrors that resolution exactly.
+ */
+export type SyncEmbedMode = 'deferred' | 'inline';
+
+/**
+ * Resolve the embed mode from the same three signals sync.ts uses to
+ * compute `effectiveNoEmbed`. Single source of truth so the cost gate and
+ * the actual embed decision can never drift.
+ *
+ *   effectiveNoEmbed = v2Enabled && !serialFlag && !noEmbed ? true : noEmbed
+ *
+ * Embed runs INLINE iff that resolves to false:
+ *   - v2 off                          → inline (legacy synchronous embed)
+ *   - v2 on + --serial + !--no-embed  → inline
+ *   - v2 on (parallel)                → deferred (backfill jobs)
+ *   - --no-embed (any path)           → the caller skips the gate entirely;
+ *                                       we report 'deferred' for completeness.
+ */
+export function willEmbedSynchronously(opts: {
+  v2Enabled: boolean;
+  serialFlag: boolean;
+  noEmbed: boolean;
+}): SyncEmbedMode {
+  const effectiveNoEmbed =
+    opts.v2Enabled && !opts.serialFlag && !opts.noEmbed ? true : opts.noEmbed;
+  return effectiveNoEmbed ? 'deferred' : 'inline';
+}
+
+/**
+ * Pure cost-gate decision. The gate BLOCKS (prompt in TTY, exit 2 envelope
+ * in non-TTY) only when embed runs inline AND the estimated spend exceeds
+ * the floor. Deferred mode NEVER blocks — the backfill cap is the real
+ * money gate, and blocking the cheap markdown import for cost the import
+ * doesn't synchronously incur is the bug this fix removes.
+ */
+export function shouldBlockSync(
+  costUsd: number,
+  floorUsd: number,
+  mode: SyncEmbedMode,
+): boolean {
+  return mode === 'inline' && costUsd > floorUsd;
+}

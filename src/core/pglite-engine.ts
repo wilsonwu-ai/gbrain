@@ -2090,6 +2090,34 @@ export class PGLiteEngine implements BrainEngine {
     return Number(count);
   }
 
+  async sumStaleChunkChars(opts?: { sourceId?: string }): Promise<number> {
+    // Sibling of countStaleChunks: same stale predicate + embed_skip filter
+    // + optional sourceId scope, summing chunk_text length for the sync
+    // cost preview. ::bigint guards int4 overflow on large brains.
+    if (opts?.sourceId === undefined) {
+      const { rows } = await this.db.query(
+        `SELECT COALESCE(SUM(LENGTH(cc.chunk_text)), 0)::bigint AS chars
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
+      );
+      const chars = (rows[0] as { chars: number | string } | undefined)?.chars ?? 0;
+      return Number(chars);
+    }
+    const { rows } = await this.db.query(
+      `SELECT COALESCE(SUM(LENGTH(cc.chunk_text)), 0)::bigint AS chars
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE cc.embedding IS NULL
+          AND p.source_id = $1
+          AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
+      [opts.sourceId],
+    );
+    const chars = (rows[0] as { chars: number | string } | undefined)?.chars ?? 0;
+    return Number(chars);
+  }
+
   async listStaleChunks(opts?: {
     batchSize?: number;
     afterPageId?: number;
