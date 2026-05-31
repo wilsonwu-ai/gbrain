@@ -87,8 +87,10 @@ const DEFAULT_DEPS: ProbeDeps = {
       { name: 'gbrain-connect-probe', version: '1' },
       { capabilities: {} },
     );
-    await client.connect(transport);
+    // close() lives in a finally that wraps connect() too — if connect()
+    // throws mid-handshake the transport/socket must still be torn down.
     try {
+      await client.connect(transport);
       // callTool's return is a wide union (incl. the legacy {toolResult}
       // shape); we only read isError + content, so narrow at the boundary.
       const res = await client.callTool({ name: 'get_brain_identity', arguments: {} });
@@ -110,10 +112,24 @@ export async function probeBrainIdentity(
   opts: { timeoutMs?: number; deps?: ProbeDeps } = {},
 ): Promise<ConnectProbeResult> {
   const deps = opts.deps ?? DEFAULT_DEPS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('timeout')), opts.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // Promise.race against a real timer: the AbortSignal alone does NOT cover
+  // client.connect()'s initialize/SSE handshake, so a server that accepts the
+  // socket then stalls before responding would hang the probe (and the whole
+  // --install) forever. The race makes the timeout guarantee actually hold —
+  // the abandoned connectAndCall promise settles in the background; the CLI
+  // exits regardless.
+  const timeoutGuard = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(new Error('timeout'));
+      // Message must contain "timeout" so classifyProbeError maps it correctly.
+      reject(new Error(`probe timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
   try {
-    const res = await deps.connectAndCall(mcpUrl, token, controller.signal);
+    const res = await Promise.race([deps.connectAndCall(mcpUrl, token, controller.signal), timeoutGuard]);
     if (res.isError) {
       const message = extractResultText(res.content) || 'unknown tool error';
       const reason = isAuthErrorMessage(message) ? 'auth' : 'tool_error';
@@ -125,6 +141,6 @@ export async function probeBrainIdentity(
     const message = e instanceof Error ? e.message : String(e);
     return { ok: false, reason: classifyProbeError(message), message };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }

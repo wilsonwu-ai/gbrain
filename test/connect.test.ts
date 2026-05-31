@@ -97,6 +97,19 @@ describe('normalizeMcpUrl', () => {
   test('empty input errors', () => {
     expect(normalizeMcpUrl('').ok).toBe(false);
   });
+
+  test('cloud-metadata / link-local hosts are rejected', () => {
+    expect(normalizeMcpUrl('http://169.254.169.254/mcp').ok).toBe(false);
+    expect(normalizeMcpUrl('http://[fe80::1]/mcp').ok).toBe(false);
+    const r = normalizeMcpUrl('http://169.254.169.254/mcp');
+    if (!r.ok) expect(r.error).toMatch(/link-local|metadata/i);
+  });
+
+  test('localhost and RFC1918/LAN hosts are still allowed (self-hosted brains)', () => {
+    expect(normalizeMcpUrl('http://localhost:3131/mcp').ok).toBe(true);
+    expect(normalizeMcpUrl('http://192.168.1.50:3131/mcp').ok).toBe(true);
+    expect(normalizeMcpUrl('https://10.0.0.5/mcp').ok).toBe(true);
+  });
 });
 
 describe('validateToken', () => {
@@ -299,6 +312,16 @@ describe('probeBrainIdentity (injected deps)', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('timeout');
   });
+  test('a connectAndCall that ignores the abort signal still times out (Promise.race)', async () => {
+    // Simulates a transport whose connect()/SSE handshake never honors the
+    // signal — the probe must still resolve via the timeout race, not hang.
+    const deps: ProbeDeps = {
+      connectAndCall: () => new Promise(() => { /* never settles, ignores signal */ }),
+    };
+    const r = await probeBrainIdentity('https://h/mcp', 'TOK', { timeoutMs: 15, deps });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('timeout');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -463,6 +486,24 @@ describe('runConnect --install', () => {
     );
     expect(r.exitCode).toBe(1);
     expect(r.err.join('\n')).toMatch(/only supports --agent claude-code/);
+  });
+
+  test('non-interactive --install without --yes is refused', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--token', 'tok', '--install'], // isTTY false (default), no --yes
+      installDeps(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toMatch(/requires --yes/);
+  });
+
+  test('a flag-shaped --token value is rejected (no silent swallow)', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--token', '--install'],
+      installDeps(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toMatch(/--token requires a value/);
   });
 });
 

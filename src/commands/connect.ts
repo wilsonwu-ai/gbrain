@@ -72,6 +72,21 @@ export type UrlResult =
   | { ok: false; error: string };
 
 /**
+ * Block link-local / cloud-metadata addresses — the one class of host that is
+ * never a legitimate brain endpoint but IS a token-exfil target (e.g. the AWS/
+ * GCP metadata service at 169.254.169.254). Deliberately does NOT block
+ * localhost or RFC1918/LAN ranges: self-hosted brains on a private network are
+ * a documented, supported topology (`gbrain serve --http --bind`).
+ */
+export function isLinkLocalOrMetadata(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(h)) return true; // IPv4 link-local incl. cloud metadata
+  if (h.startsWith('fe80:')) return true;                  // IPv6 link-local
+  if (h === 'fd00:ec2::254') return true;                  // AWS IMDSv2 over IPv6
+  return false;
+}
+
+/**
  * Normalize an MCP URL to a canonical `<scheme>//<host><path>` ending in /mcp.
  * Explicit spec (not best-effort) — see plan D-codex findings.
  */
@@ -101,6 +116,9 @@ export function normalizeMcpUrl(input: string): UrlResult {
   }
   if (u.search) {
     return { ok: false, error: 'Remove the query string from the MCP URL.' };
+  }
+  if (isLinkLocalOrMetadata(u.hostname)) {
+    return { ok: false, error: `Refusing to target a link-local / cloud-metadata address (${u.hostname}). Point the MCP URL at the brain host's real address.` };
   }
   const host = u.host; // host:port; hostname already lowercased by URL
   const path = u.pathname;
@@ -291,6 +309,7 @@ interface ParsedFlags {
   timeoutMs: number;
   help: boolean;
   agentError?: string;
+  argError?: string;
 }
 
 function parseArgs(args: string[]): ParsedFlags {
@@ -305,7 +324,21 @@ function parseArgs(args: string[]): ParsedFlags {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     help: false,
   };
-  for (let i = 0; i < args.length; i++) {
+  // Read the value for a value-taking flag, refusing a missing value or one
+  // that is itself a flag (e.g. `--token --install` would otherwise silently
+  // consume `--install` as the token and leave install off). Shares `i` with
+  // the loop below, so it is declared in the function body, not the for-header.
+  let i = 0;
+  const takeValue = (flag: string): string | undefined => {
+    const v = args[i + 1];
+    if (v === undefined || v.startsWith('--')) {
+      out.argError = `${flag} requires a value.`;
+      return undefined;
+    }
+    i++;
+    return v;
+  };
+  for (; i < args.length; i++) {
     const a = args[i];
     switch (a) {
       case '--help': case '-h': out.help = true; break;
@@ -314,16 +347,19 @@ function parseArgs(args: string[]): ParsedFlags {
       case '--force': out.force = true; break;
       case '--json': out.json = true; break;
       case '--show-token': out.showToken = true; break;
-      case '--token': out.token = args[++i]; break;
-      case '--name': out.name = args[++i] ?? out.name; break;
+      case '--token': { const v = takeValue('--token'); if (v !== undefined) out.token = v; break; }
+      case '--name': { const v = takeValue('--name'); if (v !== undefined) out.name = v; break; }
       case '--agent': {
-        const v = args[++i];
+        const v = takeValue('--agent');
+        if (v === undefined) break;
         if (v === 'claude-code' || v === 'generic') out.agent = v;
         else out.agentError = `Unknown --agent '${v}'. Use claude-code or generic.`;
         break;
       }
       case '--timeout-ms': {
-        const n = parseInt(args[++i] ?? '', 10);
+        const raw = takeValue('--timeout-ms');
+        if (raw === undefined) break;
+        const n = parseInt(raw, 10);
         if (Number.isFinite(n) && n > 0) out.timeoutMs = n;
         break;
       }
@@ -346,6 +382,7 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
     console.log(HELP);
     return;
   }
+  if (f.argError) fail(f.argError);
   if (f.agentError) fail(f.agentError);
   if (!isValidName(f.name)) {
     fail(`Invalid --name '${f.name}'. Use a lowercase identifier matching ${NAME_RE}.`);
@@ -384,21 +421,30 @@ export async function runConnect(args: string[], deps: ConnectDeps = defaultDeps
     fail(`An MCP server named '${f.name}' already exists in Claude Code. Run 'claude mcp remove ${f.name}' first, pass --name <other>, or --force to replace it.`);
   }
 
-  if (!f.yes && deps.isTTY()) {
+  if (!f.yes) {
+    if (!deps.isTTY()) {
+      // Non-interactive --install registers a credential-bearing MCP server and
+      // fires the token at a remote host — require an explicit --yes rather than
+      // silently proceeding when there's no TTY to confirm at.
+      fail('--install in a non-interactive shell requires --yes (refusing to register a credential-bearing MCP server without confirmation).');
+    }
     const ok = await deps.promptYesNo(`Add MCP server '${f.name}' -> ${url} to Claude Code?`);
     if (!ok) fail('Aborted.');
   }
 
+  let removedExisting = false;
   if (exists && f.force) {
     const rm = deps.runClaude(['mcp', 'remove', f.name]);
     if (rm.code !== 0) {
       fail(`Could not replace existing server '${f.name}': ${redactToken(rm.stderr || rm.stdout, realToken)}`);
     }
+    removedExisting = true;
   }
 
   const add = deps.runClaude(buildClaudeMcpAddArgv({ name: f.name, url, headerToken: realToken }));
   if (add.code !== 0) {
-    fail(`'claude mcp add' failed: ${redactToken(add.stderr || add.stdout, realToken)}`);
+    const note = removedExisting ? ` (note: the previous '${f.name}' was already removed — re-run to restore it)` : '';
+    fail(`'claude mcp add' failed${note}: ${redactToken(add.stderr || add.stdout, realToken)}`);
   }
   console.error(`Added MCP server '${f.name}' -> ${url}.`);
 
