@@ -21,7 +21,8 @@
  *     rotation (via configureGateway()) invalidates stale entries.
  */
 
-import { embed as aiEmbed, embedMany, generateObject, generateText } from 'ai';
+import { embed as aiEmbed, embedMany, generateObject, generateText, jsonSchema } from 'ai';
+import type { ModelMessage } from 'ai';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { listRecipes } from './recipes/index.ts';
 import { createOpenAI } from '@ai-sdk/openai';
@@ -2435,6 +2436,80 @@ async function classifyGatewayGuardrail(input: {
   }
 }
 
+/**
+ * Coerce a value into a JSON-safe form for an AI SDK tool-result `output.value`.
+ * `undefined` → `null`; functions / non-serializable members are dropped by the
+ * JSON round-trip; a cyclic / unserializable value falls back to its String form
+ * so a tool that returns something exotic can't throw inside generateText.
+ */
+function jsonSafeOutput(raw: unknown): unknown {
+  if (raw === undefined) return null;
+  try {
+    return JSON.parse(JSON.stringify(raw));
+  } catch {
+    return String(raw);
+  }
+}
+
+/**
+ * Convert gbrain's provider-neutral ChatMessage[] into AI SDK v6 ModelMessage[]
+ * at the gateway boundary. This is the single place that knows the SDK wire
+ * shape, so `toolLoop` (and every other caller) stays provider-neutral.
+ *
+ * The load-bearing conversions:
+ *   - tool-result blocks must ride on a `role:'tool'` message (v6 forbids them
+ *     in user/assistant content), with `output` as a typed union
+ *     `{type:'json'|'error-text', value}` — NOT a raw value, and NO `isError`
+ *     field (v6 encodes errors via `output.type`).
+ *   - tool-call blocks keep `input` (v6 renamed `args`→`input` in v5).
+ *   - text + tool-free user/assistant messages pass through unchanged (identity
+ *     for the non-tool chat callers: think / expansion / facts).
+ *
+ * A message that mixes tool-result blocks with other parts is split: non-result
+ * parts stay on the original role, results move to a sibling `role:'tool'`
+ * message (preserves order). Internally toolLoop never mixes them, but legacy
+ * Anthropic-shaped rows replayed through here can, so we handle it.
+ */
+export function toModelMessages(messages: ChatMessage[]): ModelMessage[] {
+  const out: ModelMessage[] = [];
+  for (const m of messages) {
+    if (typeof m.content === 'string') {
+      out.push({ role: m.role, content: m.content } as ModelMessage);
+      continue;
+    }
+    const toolResults = m.content.filter((b) => b.type === 'tool-result');
+    const others = m.content.filter((b) => b.type !== 'tool-result');
+    if (others.length > 0 || toolResults.length === 0) {
+      const parts = others.map((b) =>
+        b.type === 'text'
+          ? { type: 'text' as const, text: b.text }
+          : {
+              type: 'tool-call' as const,
+              toolCallId: b.toolCallId,
+              toolName: b.toolName,
+              input: b.input,
+            },
+      );
+      out.push({ role: m.role, content: parts } as ModelMessage);
+    }
+    if (toolResults.length > 0) {
+      const parts = toolResults.map((b) => {
+        const tr = b as { toolCallId: string; toolName: string; output: unknown; isError?: boolean };
+        return {
+          type: 'tool-result' as const,
+          toolCallId: tr.toolCallId,
+          toolName: tr.toolName,
+          output: tr.isError
+            ? { type: 'error-text' as const, value: typeof tr.output === 'string' ? tr.output : String(jsonSafeOutput(tr.output)) }
+            : { type: 'json' as const, value: jsonSafeOutput(tr.output) },
+        };
+      });
+      out.push({ role: 'tool', content: parts } as ModelMessage);
+    }
+  }
+  return out;
+}
+
 export async function chat(opts: ChatOpts): Promise<ChatResult> {
   const tracker = __budgetStore.getStore() ?? null;
   const modelStrEarly = opts.model ?? getChatModel();
@@ -2528,7 +2603,11 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   const tools = (opts.tools ?? []).reduce((acc, t) => {
     acc[t.name] = {
       description: t.description,
-      inputSchema: { jsonSchema: t.inputSchema } as any,
+      // AI SDK v6 expects a real Schema here (Zod or jsonSchema()-wrapped). A
+      // bare { jsonSchema } object falls through asSchema() and the SDK calls it
+      // as a function ("schema is not a function"). jsonSchema() wraps a raw
+      // JSON Schema 7 object into a Schema with the schema symbol + validate.
+      inputSchema: jsonSchema(t.inputSchema as any),
     };
     return acc;
   }, {} as Record<string, any>);
@@ -2558,7 +2637,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     const result = await generateText({
       model,
       system: opts.system,
-      messages: opts.messages as any,
+      messages: toModelMessages(opts.messages),
       tools: opts.tools && opts.tools.length > 0 ? tools : undefined,
       maxOutputTokens: opts.maxTokens ?? 4096,
       abortSignal: opts.abortSignal,

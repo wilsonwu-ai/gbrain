@@ -18,7 +18,8 @@
 
 import { chat as gatewayChat, toolLoop, type ChatMessage, type ChatToolDef, type ToolHandler } from '../ai/gateway.ts';
 import { BRAIN_TOOL_ALLOWLIST } from '../minions/tools/brain-allowlist.ts';
-import { operations, type OperationContext } from '../operations.ts';
+import { operations, type OperationContext, type ParamDef } from '../operations.ts';
+import { paramDefToSchema } from '../../mcp/tool-defs.ts';
 import { loadConfig } from '../config.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { BenchmarkTask, Trajectory } from './types.ts';
@@ -207,11 +208,14 @@ function stripBrainPrefix(toolName: string): string {
   return toolName.startsWith('brain_') ? toolName.slice('brain_'.length) : toolName;
 }
 
-function paramsToSchema(params: Record<string, { type: string; description?: string; required?: boolean }>): Record<string, unknown> {
+function paramsToSchema(params: Record<string, ParamDef>): Record<string, unknown> {
   return {
     type: 'object' as const,
     properties: Object.fromEntries(
-      Object.entries(params).map(([k, v]) => [k, { type: v.type, description: v.description }]),
+      // Reuse the canonical ParamDef→JSON Schema mapper so enum/default/items
+      // survive (the same mapper subagent + MCP + HTTP use). The prior
+      // {type,description}-only map silently dropped that metadata.
+      Object.entries(params).map(([k, v]) => [k, paramDefToSchema(v)]),
     ),
     required: Object.entries(params).filter(([, v]) => v.required).map(([k]) => k),
   };
