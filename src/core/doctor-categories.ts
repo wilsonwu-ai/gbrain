@@ -150,6 +150,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'subagent_capability',
   'subagent_health',
   'supervisor',
+  'supervisor_niceness',
   'sync_consolidation',
   'wedged_queue',
   'worker_oom_loop',

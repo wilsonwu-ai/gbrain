@@ -84,6 +84,17 @@ export interface SupervisorOpts {
    *  resolveDefaultMaxRssMb() (issue #1678) instead of a flat default.
    *  Set to 0 to spawn the worker without a watchdog. */
   maxRssMb: number;
+  /** Niceness (issue #1815) the operator requested via `--nice` / `GBRAIN_NICE`,
+   *  or undefined to inherit. When set, the worker is spawned with `--nice N` so
+   *  it re-applies the value (the supervisor itself is reniced by the CLI layer,
+   *  before construction). The apply RESULT is computed in jobs.ts and passed in
+   *  here purely so the `started` audit event records what actually happened —
+   *  the supervisor does not call setPriority. */
+  nice_requested?: number;
+  /** Effective niceness of the supervisor process after its own renice attempt. */
+  nice_effective?: number;
+  /** Error string if the supervisor's own renice failed (e.g. EPERM). */
+  nice_error?: string;
   /**
    * issue #1801 — progress watchdog. When a child is alive but makes no forward
    * progress on claimable work for this many minutes (waiting_claimable > 0 and
@@ -141,6 +152,30 @@ const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
   wedgeRestartLoopWindowMs: 30 * 60_000,
   startupGraceMs: 120_000, // overridden to 2× healthInterval in the constructor
 };
+
+/**
+ * Build the argv the supervisor uses to spawn `gbrain jobs work`. Extracted from
+ * runSuperviseLoop so it's unit-testable (issue #1815, Codex). Appends `--nice N`
+ * when the operator requested a niceness, alongside the existing concurrency /
+ * queue / max-rss flags. The spawned worker re-applies the niceness to itself;
+ * niceness also inherits to the worker's own children automatically.
+ */
+export function buildWorkerArgs(
+  opts: Pick<SupervisorOpts, 'concurrency' | 'queue' | 'maxRssMb' | 'nice_requested'>,
+): string[] {
+  const args = [
+    'jobs', 'work',
+    '--concurrency', String(opts.concurrency),
+    '--queue', opts.queue,
+  ];
+  if (opts.maxRssMb > 0) {
+    args.push('--max-rss', String(opts.maxRssMb));
+  }
+  if (opts.nice_requested !== undefined) {
+    args.push('--nice', String(opts.nice_requested));
+  }
+  return args;
+}
 
 /** Grace before SIGKILL when restarting a wedged child — reuses the 35s
  *  shutdown() drain window (issue #1801, D3). */
@@ -424,6 +459,11 @@ export class MinionSupervisor {
       concurrency: this.opts.concurrency,
       queue: this.opts.queue,
       max_crashes: this.opts.maxCrashes,
+      // Niceness (issue #1815): record requested + effective so doctor/status can
+      // surface a failed renice even for a detached supervisor whose stderr is gone.
+      ...(this.opts.nice_requested !== undefined ? { nice_requested: this.opts.nice_requested } : {}),
+      ...(this.opts.nice_effective !== undefined ? { nice_effective: this.opts.nice_effective } : {}),
+      ...(this.opts.nice_error ? { nice_error: this.opts.nice_error } : {}),
     });
 
     // 6. Derive the claimable job-name set for the wedge watchdog (issue #1801).
@@ -603,14 +643,7 @@ export class MinionSupervisor {
    * so JSONL audit consumers see byte-compatible output.
    */
   private async runSuperviseLoop(): Promise<void> {
-    const workerArgs = [
-      'jobs', 'work',
-      '--concurrency', String(this.opts.concurrency),
-      '--queue', this.opts.queue,
-    ];
-    if (this.opts.maxRssMb > 0) {
-      workerArgs.push('--max-rss', String(this.opts.maxRssMb));
-    }
+    const workerArgs = buildWorkerArgs(this.opts);
 
     // Build child env. Explicit handling for GBRAIN_ALLOW_SHELL_JOBS:
     // inherit only when caller opts in, otherwise strip from the clone.
@@ -666,6 +699,7 @@ export class MinionSupervisor {
           pid: event.pid >= 0 ? event.pid : undefined,
           cli_path: this.opts.cliPath,
           ...(event.tini ? { tini: true } : {}),
+          ...(this.opts.nice_requested !== undefined ? { nice: this.opts.nice_requested } : {}),
         });
         return;
 

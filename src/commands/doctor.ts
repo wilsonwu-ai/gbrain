@@ -4136,19 +4136,11 @@ export async function buildChecks(
   try {
     const { DEFAULT_PID_FILE } = await import('../core/minions/supervisor.ts');
     const { readSupervisorEvents, summarizeCrashes } = await import('../core/minions/handlers/supervisor-audit.ts');
+    const { readSupervisorPid } = await import('../core/minions/supervisor-pid.ts');
 
-    let supervisorPid: number | null = null;
-    let running = false;
-    if (existsSync(DEFAULT_PID_FILE)) {
-      try {
-        const line = readFileSync(DEFAULT_PID_FILE, 'utf8').trim().split('\n')[0];
-        const parsed = parseInt(line, 10);
-        if (!isNaN(parsed) && parsed > 0) {
-          supervisorPid = parsed;
-          try { process.kill(parsed, 0); running = true; } catch { running = false; }
-        }
-      } catch { /* unreadable */ }
-    }
+    const pidStatus = readSupervisorPid(DEFAULT_PID_FILE);
+    const supervisorPid = pidStatus.pid;
+    const running = pidStatus.running;
 
     const events = readSupervisorEvents({ sinceMs: 24 * 60 * 60 * 1000 });
     const lastStart = events.filter(e => e.event === 'started').pop()?.ts ?? null;
@@ -4202,6 +4194,64 @@ export async function buildChecks(
     }
   } catch {
     // Audit read / import failure is best-effort; skip silently.
+  }
+
+  // 3b-sexies. Supervisor/worker scheduling priority (niceness, issue #1815).
+  // SEPARATE check from `supervisor` above so a niceness divergence warn can
+  // never clobber the supervisor check's max_crashes_exceeded fail/warn
+  // precedence (Codex #11). Only surfaces when --nice was actually used (a live
+  // worker exists or the supervisor recorded a niceness), so installs that never
+  // touched --nice get no noise.
+  try {
+    const { DEFAULT_PID_FILE } = await import('../core/minions/supervisor.ts');
+    const { readSupervisorPid } = await import('../core/minions/supervisor-pid.ts');
+    const { readWorkers } = await import('../core/minions/worker-registry.ts');
+    const { getEffectiveNiceness, formatNice } = await import('../core/minions/niceness.ts');
+
+    const sup = readSupervisorPid(DEFAULT_PID_FILE);
+    const supervisorNice = sup.running && sup.pid !== null ? getEffectiveNiceness(sup.pid) : null;
+    const workers = readWorkers().map(w => ({
+      pid: w.pid,
+      queue: w.queue,
+      brain_id: w.brain_id,
+      nice_requested: w.nice_requested,
+      nice_effective: w.nice_now,
+    }));
+
+    if (workers.length > 0 || supervisorNice !== null) {
+      // Divergence: a worker (or the supervisor) asked for a niceness it didn't
+      // get — usually negative nice without privilege, or an RLIMIT_NICE clamp.
+      const diverged = workers.filter(
+        w => w.nice_requested !== null && w.nice_effective !== null && w.nice_requested !== w.nice_effective,
+      );
+
+      const workerSummary = workers
+        .map(w => `pid ${w.pid}=${w.nice_effective !== null ? formatNice(w.nice_effective) : '?'}`)
+        .join(', ');
+      const supPart = supervisorNice !== null ? `supervisor=${formatNice(supervisorNice)}` : '';
+      const okMsg = [supPart, workerSummary && `workers: ${workerSummary}`].filter(Boolean).join('; ');
+
+      if (diverged.length > 0) {
+        const detail = diverged
+          .map(w => `pid ${w.pid} requested ${formatNice(w.nice_requested!)} but running at ${formatNice(w.nice_effective!)}`)
+          .join('; ');
+        checks.push({
+          name: 'supervisor_niceness',
+          status: 'warn',
+          message: `Niceness not applied as requested (${detail}). Negative nice needs privilege; the OS may also clamp to RLIMIT_NICE. Workers run at their inherited priority.`,
+          details: { supervisor_nice: supervisorNice, workers },
+        });
+      } else {
+        checks.push({
+          name: 'supervisor_niceness',
+          status: 'ok',
+          message: okMsg || 'No niceness override active',
+          details: { supervisor_nice: supervisorNice, workers },
+        });
+      }
+    }
+  } catch {
+    // Registry / import failure is best-effort; skip silently.
   }
 
   // 3b-quater. Worker OOM-loop (issue #1685 GAP A) — the single authoritative
