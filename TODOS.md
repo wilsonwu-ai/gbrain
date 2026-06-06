@@ -1,5 +1,23 @@
 # TODOS
 
+## idea-lineage follow-ups (v0.42.27.0)
+
+Filed from the v0.42.27.0 idea-lineage wave. The `idea_lineage` op shipped
+**local-only** (`localOnly: true` + in-handler `ctx.remote` reject) because the
+read primitives it composes don't filter source/visibility uniformly yet.
+Surfaced by the adversarial review (federated-scope + remote-visibility findings).
+
+- [ ] **P3 — Make `idea_lineage` remote/federated-callable.** Today it's
+  local-only. Lifting that requires: (1) extend `getBacklinks` and `getTimeline`
+  to accept the federated `sourceIds` array (they're scalar-`sourceId`-only,
+  `engine.ts:1138`/`:1317`) and a `remote` visibility filter, mirroring
+  `findTrajectory`'s `remote=true -> visibility='world'`; (2) source-scope the
+  cached contradiction findings (`loadContradictionsTrend` is global; the op
+  slug-filters in-memory, which doesn't prove the run was built from
+  visible/sourced evidence). Defer until a remote consumer (thin-client think,
+  a team-brain agent) actually needs lineage. Until then the localOnly gate is
+  the fail-closed correct posture.
+
 ## v0.42.21.0 module-singleton ownership follow-ups (v0.42+)
 
 Filed from the v0.42.21.0 wave (#1404/#1471/#1619 — the dream-cycle

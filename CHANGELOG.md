@@ -2,6 +2,40 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.27.0] - 2026-06-04
+
+**Trace how one idea evolved through your brain — now a real command, not just a workflow.** Ask "how has my thinking about founder-led sales changed" and gbrain resolves that idea to its best anchor, then gathers the dated evidence behind its lineage: first mentions, related concepts (via the link graph, not just keyword overlap), timeline anchors, attributed takes, an optional entity trajectory, and any cached contradictions that touch it. The `idea-lineage` skill (started as a community contribution) gets a hardened routing boundary and a graph/timeline-aware gather phase, and the deterministic gather step is promoted to a first-class `gbrain idea-lineage <idea>` command + `idea_lineage` MCP op so other tools can call it directly. A `gbrain eval idea-lineage` surface and a synthetic-corpus recovery test prove it actually recovers a known lineage.
+
+The op is **local-only** by design: it composes read primitives whose source/visibility filtering isn't uniform yet, so v1 is scoped to the local CLI and trusted local callers rather than exposed to remote MCP. Classification (what's a reversal vs an abandoned branch) stays in the agent/skill; the op returns evidence, not narrative, so it stays deterministic and engine-parity-testable.
+
+Thanks to @davidNbreslauer (#1830) for the original idea-lineage skill this builds on.
+
+### Added
+- `gbrain idea-lineage <idea>` (and the `idea_lineage` MCP op): resolve a free-text idea to a concept/page anchor and return its dated evidence bundle — matches, related concepts (backlinks + depth-2 graph), timeline anchors, takes, optional entity trajectory, and idea-scoped cached contradictions. Returns candidate anchors + a `disambiguation_needed` flag when an idea resolves to more than one strong anchor, and a `degraded` flag when semantic search was unavailable.
+- `gbrain eval idea-lineage <idea>`: evidence-coverage eval over the local brain, with a new `lineage_evidence_coverage` metric in the glossary. Per-run records land in `.gbrain-evals/` (now gitignored).
+- Synthetic-corpus feature-recovery test + a cross-engine determinism case for the gather op.
+
+### Changed
+- The `idea-lineage` skill now uses the link graph and timeline for related-concept and date discovery (not just flat search), carries a concrete high/medium/low confidence rubric, and has a hardened routing boundary (adversarial fixtures separating it from `concept-synthesis` and trajectory queries).
+- The contradiction slug-filter is now a shared helper reused by both `find_contradictions` and `idea_lineage` (no duplicated filtering logic).
+
+### Fixed
+- Test isolation: the suite now points `GBRAIN_HOME` at a throwaway temp dir so "no API key configured" tests (think degradation, key-presence probes, embedding-health, dream synthesize) pass on a developer machine with a configured brain, instead of resolving a real key from `~/.gbrain/config.json` and failing only locally. Local runs now match CI.
+
+### To take advantage of v0.42.27.0
+
+After `gbrain upgrade`, trace an idea from the CLI:
+
+```bash
+gbrain idea-lineage "founder-led sales" --json
+```
+
+The agent-facing `idea_lineage` tool is available to local MCP callers automatically. To gauge how much multi-angle evidence your brain holds for an idea:
+
+```bash
+gbrain eval idea-lineage "founder-led sales"
+```
+
 ## [0.42.26.0] - 2026-06-04
 
 **The Supabase setup docs now match the current dashboard and call out the one thing that actually breaks on IPv4 hosts.** The connection-string instructions were written for the old Supabase UI (two options under Project Settings) and used inconsistent pooler names: some docs said "Connection pooler," others mislabeled port 6543 as the "Session pooler," and a few carried a stale warning to avoid the transaction pooler entirely. The current Supabase UI puts the string under **Connect** in the top navigation with three options (Direct, Transaction pooler, Session pooler). gbrain is tuned for the **Transaction pooler** (port 6543): it disables prepared statements there and routes migrations, DDL, and worker locks to a separate direct connection. This release makes every setup surface say that, consistently.
