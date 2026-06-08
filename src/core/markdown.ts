@@ -129,18 +129,15 @@ export function parseMarkdown(
   // → number, a bare date → Date). The `as string` cast used to lie: a truthy
   // non-string flowed downstream typed as string and crashed the first
   // `.toLowerCase()` (content-sanity), aborting the whole lint/sync run.
-  //   - title: coerce to a string (preserve intent; `title: 123` → "123").
-  //   - type/slug: NEVER fabricated from a non-string (a coerced "123" slug
-  //     collides + diverges from the slug validator — outside-voice OV3a). Fall
-  //     back to inference; the NON_STRING_FIELD lint finding below surfaces it.
-  const rawType = frontmatter.type;
-  const type = (typeof rawType === 'string' && rawType.length > 0 ? rawType : (
+  // coerceFrontmatterString turns a scalar/date into a usable string (a date slug
+  // `2024-06-01` is legitimate); the NON_STRING_FIELD lint finding below still
+  // surfaces the un-quoted field so it can be cleaned up.
+  const type = coerceFrontmatterString(frontmatter.type) || (
     opts?.activePack ? inferTypeFromPack(filePath, opts.activePack) : inferType(filePath)
-  )) as PageType;
+  );
   const title = coerceFrontmatterString(frontmatter.title).trim() || inferTitle(filePath);
   const tags = extractTags(frontmatter);
-  const rawSlug = frontmatter.slug;
-  const slug = typeof rawSlug === 'string' && rawSlug.length > 0 ? rawSlug : inferSlug(filePath);
+  const slug = coerceFrontmatterString(frontmatter.slug) || inferSlug(filePath);
 
   const cleanFrontmatter = { ...frontmatter };
   delete cleanFrontmatter.type;

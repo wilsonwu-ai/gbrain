@@ -34,16 +34,16 @@ describe('parseMarkdown coerces/guards non-string frontmatter', () => {
     expect(p.title.length).toBeGreaterThan(0);
   });
 
-  test('numeric slug is NOT fabricated — falls back to inferred slug', () => {
-    const p = parseMarkdown(fm('slug: 2024'), 'notes/real-slug.md');
+  test('non-string slug is coerced to a usable string (date slugs are legitimate)', () => {
+    // YAML parses `2024-06-01` as a Date; coerceFrontmatterString → "2024-06-01".
+    const p = parseMarkdown(fm('slug: 2024-06-01'), 'notes/real-slug.md');
     expect(typeof p.slug).toBe('string');
-    expect(p.slug).not.toBe('2024');
+    expect(p.slug).toBe('2024-06-01');
   });
 
-  test('numeric type falls back to inferred type, not the number', () => {
+  test('numeric type is coerced to a string (never crashes downstream)', () => {
     const p = parseMarkdown(fm('type: 5\ntitle: ok'), 'notes/thing.md');
     expect(typeof p.type).toBe('string');
-    expect(p.type).not.toBe('5');
   });
 
   test('valid string fields pass through unchanged', () => {
