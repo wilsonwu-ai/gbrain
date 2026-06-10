@@ -43,8 +43,8 @@ genuinely has to change.
 Switching dimensions requires:
 
 1. Dropping the HNSW vector index (pgvector won't survive an `ALTER COLUMN TYPE`).
-2. Altering the column type (Postgres only — PGLite cannot do this).
-3. Wiping every existing embedding (the old vectors are unusable in the new space).
+2. Wiping every existing embedding (the old vectors are unusable in the new space — and pgvector refuses to cast them across dimensions, so this must happen before the alter).
+3. Altering the column type (Postgres only — PGLite cannot do this).
 4. Re-embedding the entire corpus (can take hours on a 50K-page brain and costs $1-100 in API calls depending on model).
 5. Conditionally recreating the index (HNSW supports up to 2000 dimensions per pgvector; above that you must use exact scans).
 
@@ -120,7 +120,7 @@ DROP INDEX IF EXISTS idx_chunks_embedding;
 --    ("expected <NEW_DIMS> dimensions, not <OLD_DIMS>"), so altering a
 --    column that still holds old-width vectors aborts the transaction.
 --    NULLs cast fine. (The old vectors are unusable in the new space
---    anyway — wiping them is step 3 of the recipe's rationale.)
+--    anyway — this is the wipe step from the rationale above.)
 UPDATE content_chunks SET embedding = NULL, embedded_at = NULL;
 
 -- 3. Alter the column type (all rows are NULL now, so the cast succeeds).
