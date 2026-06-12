@@ -270,12 +270,16 @@ async function main() {
 
   // Per-command --help
   if (hasHelpFlag(subArgs)) {
+    // `eval brainbench` ships a published foreign-runner flag surface — its
+    // own usage() must win over the generic eval stub (codex P3). Fall
+    // through to handleCliOnly's no-DB brainbench route, which prints it.
+    const selfHelpSub = command === 'eval' && subArgs[0] === 'brainbench';
     const op = cliOps.get(command) ?? cliAliases.get(command);
-    if (op) {
+    if (op && !selfHelpSub) {
       printOpHelp(op, command);
       return;
     }
-    if (CLI_ONLY.has(command) && !CLI_ONLY_SELF_HELP.has(command)) {
+    if (!selfHelpSub && CLI_ONLY.has(command) && !CLI_ONLY_SELF_HELP.has(command)) {
       printCliOnlyHelp(command);
       return;
     }

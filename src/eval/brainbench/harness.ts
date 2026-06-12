@@ -243,14 +243,15 @@ export async function runBrainBench(
         }
       }
 
-      // Continuity writers are EXCLUDED here even when they declare both
-      // retrieval and write-back suites — the pair loop owns their write-back
-      // score (adversarial finding: a hybrid writer would double-count into
-      // the cell from two differently-seeded brain states).
+      // Exactly ONE owner per writer's write-back score: the pair loop owns it
+      // when continuity is being run (adversarial finding: a hybrid writer
+      // double-counted); THIS loop owns it when continuity is filtered out
+      // (codex P2: `--suite write-back` alone silently dropped the writers'
+      // 12 gold items — 46 vs 58 between filtered and default runs).
       if (
         lf.fixture.suites.includes('write-back') &&
         wantedSuites.has('write-back') &&
-        !lf.fixture.continuity
+        !(lf.fixture.continuity && wantedSuites.has('continuity'))
       ) {
         const score = await runWriteBack(engine, lf.fixture, lf.gold, {
           llm: opts.llm,
