@@ -99,3 +99,74 @@ describe('pglite-lock', () => {
     await releaseLock(lock2);
   });
 });
+
+describe('pglite-lock #2058 heartbeat + steal-grace', () => {
+  beforeEach(() => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, force: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+  afterEach(() => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, force: true });
+  });
+
+  function writeHolder(fields: { pid: number; acquiredAgoMs: number; refreshedAgoMs: number }) {
+    const lockDir = join(TEST_DIR, '.gbrain-lock');
+    mkdirSync(lockDir, { recursive: true });
+    const now = Date.now();
+    writeFileSync(join(lockDir, 'lock'), JSON.stringify({
+      pid: fields.pid,
+      acquired_at: now - fields.acquiredAgoMs,
+      refreshed_at: now - fields.refreshedAgoMs,
+      command: 'test holder',
+    }));
+  }
+
+  test('[REGRESSION] a LIVE holder with a fresh heartbeat is NOT stolen even when the lock is old', async () => {
+    // The WAL-corruption bug: a >5min embed used to get its lock force-removed.
+    // Now an alive holder that heartbeated recently is left alone regardless of
+    // age. acquired 20min ago, but refreshed just now → must wait, not steal.
+    writeHolder({ pid: process.pid, acquiredAgoMs: 20 * 60_000, refreshedAgoMs: 0 });
+
+    await expect(acquireLock(TEST_DIR, { timeoutMs: 1200 })).rejects.toThrow(/Timed out/);
+    // Holder's lock still present (was never stolen).
+    expect(existsSync(join(TEST_DIR, '.gbrain-lock'))).toBe(true);
+  });
+
+  test('a LIVE PID whose heartbeat went stale past the grace window IS reaped', async () => {
+    // PID is alive (our own) but hasn't refreshed in 20min (> 600s grace):
+    // hung holder, or a reused PID whose real holder is gone. Reap + acquire.
+    writeHolder({ pid: process.pid, acquiredAgoMs: 25 * 60_000, refreshedAgoMs: 20 * 60_000 });
+
+    const lock = await acquireLock(TEST_DIR, { timeoutMs: 2000 });
+    expect(lock.acquired).toBe(true);
+    await releaseLock(lock);
+  });
+
+  test('GBRAIN_PGLITE_LOCK_STEAL_GRACE_SECONDS tunes the grace window', async () => {
+    const prev = process.env.GBRAIN_PGLITE_LOCK_STEAL_GRACE_SECONDS;
+    process.env.GBRAIN_PGLITE_LOCK_STEAL_GRACE_SECONDS = '5'; // 5s grace
+    try {
+      // Refreshed 30s ago — fresh under the 600s default, STALE under 5s.
+      writeHolder({ pid: process.pid, acquiredAgoMs: 60_000, refreshedAgoMs: 30_000 });
+      const lock = await acquireLock(TEST_DIR, { timeoutMs: 2000 });
+      expect(lock.acquired).toBe(true);
+      await releaseLock(lock);
+    } finally {
+      if (prev === undefined) delete process.env.GBRAIN_PGLITE_LOCK_STEAL_GRACE_SECONDS;
+      else process.env.GBRAIN_PGLITE_LOCK_STEAL_GRACE_SECONDS = prev;
+    }
+  });
+
+  test('acquire starts a heartbeat and seeds refreshed_at; release clears it', async () => {
+    const lock: LockHandle = await acquireLock(TEST_DIR);
+    expect(lock.acquired).toBe(true);
+    expect(lock.heartbeat).toBeDefined();
+    const data = JSON.parse(readFileSync(join(TEST_DIR, '.gbrain-lock', 'lock'), 'utf-8'));
+    expect(data.refreshed_at).toBeDefined();
+    expect(typeof data.refreshed_at).toBe('number');
+
+    await releaseLock(lock);
+    expect(lock.heartbeat).toBeUndefined();
+    expect(existsSync(join(TEST_DIR, '.gbrain-lock'))).toBe(false);
+  });
+});
