@@ -363,9 +363,67 @@ async function main() {
   // process exit happens once, in the import.meta.main seam at the bottom of
   // this file — NOT here.
 
+  // v0.42.41.0 (merged): wallclock bound for READ-scope op handlers. With the
+  // teardown backstop correctly scoped to teardown, a genuinely WEDGED read
+  // handler (hung pooler connection mid-query) would otherwise hang the CLI
+  // forever — the #1633 zombie class the old pre-try timer accidentally
+  // bounded at 10s. 180s sits far above any healthy slow-pooler run
+  // (6-10s/connection); --timeout=Ns overrides. Writes/admin stay unbounded:
+  // a long import/embed must never be killed by a default deadline. On
+  // timeout the abandoned handler may hold ref'd sockets — harmless here,
+  // because the import.meta.main seam exits explicitly on every one-shot path.
+  const READ_OP_TIMEOUT_MS = 180_000;
+
   try {
-    const ctx = await makeContext(engine, params);
-    const rawResult = await op.handler(ctx, params);
+    const { withTimeout, OperationTimeoutError } = await import('./core/timeout.ts');
+    const wallclockMs = getCliOptions().timeoutMs ?? READ_OP_TIMEOUT_MS;
+    const onWallclockTimeout = (e: InstanceType<typeof OperationTimeoutError>) => {
+      const hint = getCliOptions().timeoutMs
+        ? ''
+        : ` (default ${e.ms}ms; pass --timeout=Ns to override)`;
+      console.error(`${e.label} timed out${hint}.`);
+      // 124 = timeout convention (matches the read-only dispatch path). Set
+      // through the verdict channel — a raw process.exitCode write is invisible
+      // to the exit seam and PGLite's WASM runtime can scribble over it.
+      setCliExitVerdict(124);
+    };
+
+    // Context build does DB I/O (resolveSourceId) and runs for EVERY op —
+    // a wedged pooler connection here would otherwise hang reads, writes,
+    // and admin alike with no bound at all (adversarial review finding).
+    let ctx: Awaited<ReturnType<typeof makeContext>>;
+    try {
+      ctx = await withTimeout(
+        makeContext(engine, params),
+        wallclockMs,
+        `gbrain ${command}: context`,
+      );
+    } catch (e: unknown) {
+      if (e instanceof OperationTimeoutError) {
+        onWallclockTimeout(e);
+        return; // the finally drains + disconnects; the import.meta.main seam exits
+      }
+      throw e;
+    }
+
+    let rawResult: unknown;
+    if (op.scope === 'read') {
+      try {
+        rawResult = await withTimeout(
+          op.handler(ctx, params),
+          wallclockMs,
+          `gbrain ${command}`,
+        );
+      } catch (e: unknown) {
+        if (e instanceof OperationTimeoutError) {
+          onWallclockTimeout(e);
+          return; // the finally drains + disconnects; the import.meta.main seam exits
+        }
+        throw e;
+      }
+    } else {
+      rawResult = await op.handler(ctx, params);
+    }
     // ENG-2 (renderer parity by data shape): JSON-round-trip the local-engine
     // path's return value so renderers see the same shape they'd see on the
     // routed path. Date → ISO string; bigint → string (postgres.js shape);
@@ -378,7 +436,8 @@ async function main() {
     // STILL runs (drains every background-work sink + disconnects). A bare
     // process.exit(1) here would skip the finally → skip the drain + disconnect
     // (leaves facts/cache/eval-capture writes racing teardown). The finally's
-    // drain bounds teardown; the outer hard-deadline timer bounds a hung one.
+    // drain bounds teardown; the hard-deadline timer armed at teardown entry
+    // bounds a hung one.
     if (e instanceof OperationError) {
       console.error(`Error [${e.code}]: ${e.message}`);
       if (e.suggestion) console.error(`  Fix: ${e.suggestion}`);
