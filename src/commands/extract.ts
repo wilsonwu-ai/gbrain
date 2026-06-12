@@ -28,6 +28,7 @@
  * pagination). FS-source preserves the original v0.10.1 walker behavior.
  */
 
+import { setCliExitCode } from '../core/cli-force-exit.ts';
 import { readFileSync, readdirSync, lstatSync, existsSync } from 'fs';
 import { join, relative, dirname } from 'path';
 import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from '../core/engine.ts';
@@ -864,7 +865,7 @@ Status (v0.42):
             (r.first_batch_error ? ` (first error: ${r.first_batch_error})` : '') +
             ` — timeline is incomplete.`,
           );
-          process.exitCode = 1;
+          setCliExitCode(1);
         }
       } else if (byMention || ner) {
         // v0.41.18.0 (T7): combined --by-mention + --ner walk shares one

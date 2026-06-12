@@ -137,3 +137,19 @@ describe('flushStdoutThenExit — deliberate exit after output drains', () => {
     expect(stream.drainListeners()).toBe(0);
   });
 });
+
+describe('exit-verdict ownership — no raw process.exitCode assignments (#2084 class pin)', () => {
+  test('every exit-code write in src/ routes through setCliExitCode', async () => {
+    // A RAW `process.exitCode = N` is silently ZEROED by the deliberate
+    // flush-exit: getCliExitCode() reads only gbrain's owned verdict (the
+    // PGLite-Emscripten-pollution defense), so a command that bypasses the
+    // setter reports success on failure. Caught live: doctor's FAIL path
+    // exited 0 after the v0.42.41.0 merge introduced a raw write.
+    const { execSync } = await import('child_process');
+    const hits = execSync(
+      `grep -rn "process.exitCode = " src --include='*.ts' | grep -v "core/cli-force-exit.ts" || true`,
+      { encoding: 'utf-8', cwd: new URL('..', import.meta.url).pathname },
+    ).trim();
+    expect(hits).toBe('');
+  });
+});
