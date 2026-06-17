@@ -2,6 +2,23 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.44.1.0] - 2026-06-17
+
+**`gbrain sync` stops bottlenecking all its workers on a single database row, a malformed checkpoint can no longer wedge a source, and `gbrain doctor` tells an actively-running sync apart from a stuck one.** A slow source that fell behind HEAD could read as permanently stale even while it imported every cycle: sync was single-core-bound at the database layer, so handing it more workers didn't help, and the freshness check couldn't see that a sync was in fact running.
+
+The root cause was the page-generation clock that backs the search cache. Every page write bumped a single locked counter row, so concurrent sync workers serialized on one another's commits no matter how many you ran. It is now a contention-free sequence: the cache invalidation contract is unchanged (it still over-invalidates rather than ever serving stale), but writers no longer wait in line. The other fixes harden checkpoint state and make the freshness signal honest.
+
+### Changed
+- **Sync writes scale across cores.** The page-generation clock moved from a single locked counter row to a contention-free sequence, so parallel sync workers stop serializing on each other. A large `gbrain sync` now uses the workers you give it instead of collapsing to roughly one.
+- **`gbrain doctor` distinguishes in-progress from stale.** A source holding a live sync lock is reported as actively syncing (naming the running process), not flagged stale. A genuinely stuck, blocked, or never-completed sync still reports stale — the signal is the live lock, so a stopped sync is never masked.
+
+### Fixed
+- **A malformed checkpoint record can no longer wedge a source.** Checkpoint state is structurally constrained, repaired automatically on upgrade, and the loader survives a bad record instead of discarding all banked progress for that source.
+- **`gbrain sync --force-break-lock` is honest when there is no lock.** It now says plainly that nothing was held and points at how to inspect a genuinely wedged sync, instead of a terse no-op that read like a successful unwedge.
+
+### To take advantage of v0.44.1.0
+`gbrain upgrade`, then `gbrain doctor`. Existing brains pick up the contention-free clock and the checkpoint integrity constraint automatically on the next migration; the search cache rebuilds itself on first query. Nothing to configure.
+
 ## [0.42.49.0] - 2026-06-16
 
 **Big embed backfills and syncs now throttle themselves when the database gets busy, so clearing a backlog can't starve the job queue — no more external babysitter scripts.** A naive `gbrain embed --stale` or large `gbrain sync` against a PgBouncer transaction-mode pooler could saturate it and starve the minion supervisor's lock renewals, cascading `lock-renewal-failed` into dead jobs. The field workaround was an external wrapper that SIGSTOP/SIGCONT'd the process off a side-pool latency probe. That approach was blind (the side pool read low latency while the pool that mattered starved), unsafe (SIGSTOP can freeze a process mid-transaction holding locks), and couldn't touch peak pressure. gbrain now does this natively, and better.
