@@ -18,6 +18,7 @@ import {
   type DurabilityReport,
 } from '../core/brain-repo-durability.ts';
 import { divergenceSafePull, detectDefaultBranch } from '../core/git-remote.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { existsSync } from 'fs';
 import { join } from 'path';
 
@@ -96,7 +97,9 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
   if (json) console.log(JSON.stringify({ reports }, null, 2));
 
   // Non-zero exit if any source needs attention, so cron/automation notices.
-  if (reports.some(r => r.needs_attention.length > 0)) process.exitCode = 3;
+  // Route through setCliExitVerdict — a raw process.exitCode write is zeroed by
+  // the owned-verdict flush-exit (#2084 / PGLite-Emscripten pollution defense).
+  if (reports.some(r => r.needs_attention.length > 0)) setCliExitVerdict(3);
 }
 
 function renderReport(r: DurabilityReport): void {
